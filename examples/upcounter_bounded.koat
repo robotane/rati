@@ -1,0 +1,18 @@
+(GOAL COMPLEXITY)
+(STARTTERM (FUNCTIONSYMBOLS koat_init))
+(VAR LI0 LI1 LI2 LI3 SI0 SI1)
+(RULES
+  koat_init(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_1(LI0, LI1, LI2, LI3, SI0, SI1)
+  b_main_exc_1(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_2(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SO1 - 1 = 0 && SO0 - 1 = 0 && LI0 >= 0
+  b_main_exc_2(LI0, LI1, LI2, LI3, SI0, SI1) -> b__init__1__nc_l0(SO1, 0, 0, 0, 0, 0) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && -SI0 + SO0 = 0 && -SI1 + SO1 = 0 && SI1 >= 0 && SI0 >= 0 && LI0 >= 0
+  b_main_exc_2(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_3(LI0, LI1, LI2, LI3, SI0, SO1)
+  b_main_exc_3(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_9(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + SO0 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SO1 - 20 = 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_3(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_4(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + SO0 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SO1 - 20 = 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_4(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_5(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + SO0 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SO1 - 10 = 0 && -SI0 + SI1 - 1 >= 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_4(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_11(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + SO0 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SO1 - 10 = 0 && -SI0 + SI1 - 1 >= 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_5(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_10(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && -SI0 + SI1 - 1 >= 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_8(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_3(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 - 2 = 0 && -LI3 + LO3 = 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_6(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_8(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_10(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_6(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && LI1 >= 0 && LI0 >= 0
+  b_main_exc_11(LI0, LI1, LI2, LI3, SI0, SI1) -> b_main_exc_6(LO0, LO1, LO2, LO3, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + LO3 = 0 && SI0 - SI1 >= 0 && LI1 >= 0 && LI0 >= 0
+)

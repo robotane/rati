@@ -1,0 +1,16 @@
+RaTI — Ranking-based Termination Inference
+Copyright 2026 robotane
+
+This product's own source code is licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+This product bundles, UNMODIFIED and as separately-replaceable components, the
+Apron numerical abstract domain library and the GMP bindings:
+
+  - fr.inria.apron:apron  (lib-repo/, lib/libjapron.so)
+  - fr.inria.apron:gmp    (lib-repo/, lib/libjgmp.so)
+
+Apron and GMP are licensed under the GNU Lesser General Public License (LGPL).
+See https://antoinemine.github.io/Apron/doc/ for their upstream sources and
+licences. They are loaded dynamically (JNI); to use a different build, replace
+the jars in lib-repo/ and the native libraries in lib/.

@@ -1,0 +1,93 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>fr.univreunion</groupId>
+  <artifactId>rati</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>RaTI</name>
+  <description>Standalone Farkas/ADFG ranking-function termination prover for KoAT
+    integer transition systems — verdict + verifiable ranking certificate, no Docker.</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <!-- Apron (polyhedra, JNI) is not on Maven Central; the jars ship in this repo's
+       lib-repo/ as a project-local Maven repository, so `mvn package` works with no
+       setup step. The matching native libraries (libjapron.so / libjgmp.so) are in
+       lib/ and loaded at run time via -Djava.library.path=lib. -->
+  <repositories>
+    <repository>
+      <id>project-lib-repo</id>
+      <url>file://${project.basedir}/lib-repo</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>fr.inria.apron</groupId>
+      <artifactId>apron</artifactId>
+      <version>0.9.13</version>
+    </dependency>
+    <dependency>
+      <groupId>fr.inria.apron</groupId>
+      <artifactId>gmp</artifactId>
+      <version>0.9.13</version>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.11</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <source>8</source>
+          <target>8</target>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.1.2</version>
+        <configuration>
+          <argLine>-Djava.library.path=${project.basedir}/lib --enable-native-access=ALL-UNNAMED</argLine>
+          <environmentVariables>
+            <LD_LIBRARY_PATH>${project.basedir}/lib</LD_LIBRARY_PATH>
+          </environmentVariables>
+        </configuration>
+      </plugin>
+      <!-- Executable rank.jar: the whole engine + Apron/GMP, main class RankMain. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <finalName>rati</finalName>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>fr.univreunion.rati.rank.RankMain</mainClass>
+                </transformer>
+              </transformers>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

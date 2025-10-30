@@ -1,0 +1,10 @@
+(GOAL COMPLEXITY)
+(STARTTERM (FUNCTIONSYMBOLS koat_init))
+(VAR LI0 LI1 LI2 LI3 LI4 LI5 SI0 SI1)
+(RULES
+  koat_init(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1) -> b_main_count_sub_neg_1(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1)
+  b_main_count_sub_neg_1(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1) -> b_main_count_sub_neg_2(LO0, LO1, LO2, LO3, LO4, LO5, SO0, SO1) :|: -LI0 + LO0 = 0 && LO3 - 10 = 0 && LO2 = 0 && LO1 + 1 = 0 && LI0 >= 0
+  b_main_count_sub_neg_2(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1) -> b_main_count_sub_neg_4(LO0, LO1, LO2, LO3, LO4, LO5, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + SO0 = 0 && -LI3 + LO3 = 0 && LI0 >= 0
+  b_main_count_sub_neg_2(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1) -> b_main_count_sub_neg_3(LO0, LO1, LO2, LO3, LO4, LO5, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 + LO2 = 0 && -LI3 + SO0 = 0 && -LI3 + LO3 = 0 && LI0 >= 0
+  b_main_count_sub_neg_3(LI0, LI1, LI2, LI3, LI4, LI5, SI0, SI1) -> b_main_count_sub_neg_2(LO0, LO1, LO2, LO3, LO4, LO5, SO0, SO1) :|: -LI0 + LO0 = 0 && -LI1 + LO1 = 0 && -LI2 - LI3 + LO2 = 0 && -LI3 + LO3 - 1 = 0 && SI0 - 1 >= 0 && LI0 >= 0
+)
