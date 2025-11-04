@@ -72,6 +72,39 @@ public class KoatParserTest {
         assertEquals(-5L, back.constant());
     }
 
+    // ---- operator coverage + malformed-token rejection (R1) ----------------
+
+    @Test
+    public void parsesLessEqualBySwappingSides() {
+        // A <= B  ≡  B - A >= 0. (legal KoAT/termCOMP; must not mis-split on '=')
+        ItsLinearConstraint c = KoatParser.parseConstraint("LI0 <= LO0");
+        assertEquals(ItsLinearConstraint.Op.GE, c.op());
+        assertEquals(-1L, c.lhs().coefficient("LI0"));
+        assertEquals(1L, c.lhs().coefficient("LO0"));
+    }
+
+    @Test
+    public void parsesStrictLessBySwappingSides() {
+        // A < B  ≡  B - A > 0.
+        ItsLinearConstraint c = KoatParser.parseConstraint("LI0 < 5");
+        assertEquals(ItsLinearConstraint.Op.GT, c.op());
+        assertEquals(-1L, c.lhs().coefficient("LI0"));
+        assertEquals(5L, c.lhs().constant());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsPhantomVariableFromMissingSpaces() {
+        // No spaces around the minus: the grammar never tokenises it, so the whole
+        // string would have become a phantom variable "LI2-LO2-1" — now rejected.
+        KoatParser.parseExpr("LI2-LO2-1");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsStrayComparisonFragmentAsVariable() {
+        // "A <" (e.g. a mis-split operator) is not a valid identifier.
+        KoatParser.parseExpr("A <");
+    }
+
     // ---- full print → parse → prove round-trip -----------------------------
 
     @Test

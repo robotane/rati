@@ -70,6 +70,16 @@ public final class RankMain {
         FarkasRanking.Certificate cert;
         try {
             cert = FarkasRanking.proveWithCertificate(parsed.its, start);
+        } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
+            // Apron's native library could not be loaded — a configuration error, not
+            // an analysis outcome. RuntimeException's catch would miss it (it is an
+            // Error), leaving a raw stack trace and an exit code outside {0,1,2}. Give
+            // the actionable hint instead and exit with the usage/setup code (2).
+            System.err.println("error: Apron native library not loaded (" + e
+                    + ").\n  Run with -Djava.library.path=<dir with libjapron.so> "
+                    + "and LD_LIBRARY_PATH set to the same directory.");
+            System.exit(2);
+            return;
         } catch (RuntimeException e) {
             // A prover bug must not masquerade as a clean MAYBE: report UNKNOWN
             // (sound) but surface the cause on stderr so it is visible.

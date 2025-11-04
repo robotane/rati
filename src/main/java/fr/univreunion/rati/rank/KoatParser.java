@@ -281,22 +281,33 @@ public final class KoatParser {
         return out;
     }
 
-    /** Parses {@code <lhs> <op> <rhs>} into a {@code (lhs - rhs) OP 0} constraint. */
+    /**
+     * Parses {@code <lhs> <op> <rhs>} into a {@code (lhs - rhs) OP 0} constraint.
+     * Supports {@code =}, {@code >=}, {@code >}, {@code <=}, {@code <} (legal KoAT /
+     * termCOMP). {@code <=}/{@code <} are normalised to {@code >=}/{@code >} by
+     * swapping the two sides, so the {@link ItsLinearConstraint} only ever carries
+     * {@code EQ}/{@code GE}/{@code GT}. The {@code <=}/{@code <} tests must precede
+     * the bare {@code <}/{@code >} ones, and all relational ones precede {@code =},
+     * so a two-character operator is never mis-split into its first character.
+     */
     static ItsLinearConstraint parseConstraint(String s) {
         ItsLinearConstraint.Op op;
         String opSym;
+        boolean swap = false;
         if (s.contains(">=")) { op = ItsLinearConstraint.Op.GE; opSym = ">="; }
-        else if (s.contains("=")) { op = ItsLinearConstraint.Op.EQ; opSym = "="; }
+        else if (s.contains("<=")) { op = ItsLinearConstraint.Op.GE; opSym = "<="; swap = true; }
         else if (s.contains(">")) { op = ItsLinearConstraint.Op.GT; opSym = ">"; }
+        else if (s.contains("<")) { op = ItsLinearConstraint.Op.GT; opSym = "<"; swap = true; }
+        else if (s.contains("=")) { op = ItsLinearConstraint.Op.EQ; opSym = "="; }
         else throw new IllegalArgumentException("no comparison operator in constraint: " + s);
 
         int idx = s.indexOf(opSym);
         String lhs = s.substring(0, idx).trim();
         String rhs = s.substring(idx + opSym.length()).trim();
 
-        ItsLinearExpression le = parseExpr(lhs);
-        ItsLinearExpression re = parseExpr(rhs);
-        // Combine into (lhs - rhs) OP 0.
+        ItsLinearExpression le = parseExpr(swap ? rhs : lhs);
+        ItsLinearExpression re = parseExpr(swap ? lhs : rhs);
+        // Combine into (lhs - rhs) OP 0  (sides already swapped for <= / <).
         ItsLinearExpression.Builder b = new ItsLinearExpression.Builder();
         b.addConstant(le.constant() - re.constant());
         for (Map.Entry<String, Long> e : le.coefficients().entrySet())
@@ -343,8 +354,19 @@ public final class KoatParser {
                 else throw new NonlinearException(t);
             } else if (isInteger(t)) {
                 b.addConstant(sign * Long.parseLong(t));
-            } else {
+            } else if (isVariable(t)) {
                 b.addTerm(t, sign);
+            } else {
+                // Not an integer, not a well-formed identifier: e.g. an operator-free
+                // expression "LI2-LO2-1" (no spaces around the minus) that the grammar
+                // never tokenised, or a stray comparison fragment "A<" from a
+                // mis-split operator. Reject it loudly rather than silently inventing a
+                // phantom variable (which would make the guard vacuous and the verdict
+                // inexplicable). KoAT/ItsLinearExpression separates terms by " + "/" - ".
+                throw new IllegalArgumentException(
+                        "malformed term '" + t + "' in expression '" + expr
+                        + "' (expected [coeff*]<identifier> or an integer, "
+                        + "terms separated by ' + ' / ' - ')");
             }
         }
         return b.build();
@@ -354,6 +376,18 @@ public final class KoatParser {
         if (s.isEmpty()) return false;
         for (int i = 0; i < s.length(); i++) {
             if (!Character.isDigit(s.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    /** A KoAT variable identifier: {@code [A-Za-z_][A-Za-z0-9_]*}. */
+    private static boolean isVariable(String s) {
+        if (s.isEmpty()) return false;
+        char c0 = s.charAt(0);
+        if (!Character.isLetter(c0) && c0 != '_') return false;
+        for (int i = 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_') return false;
         }
         return true;
     }
