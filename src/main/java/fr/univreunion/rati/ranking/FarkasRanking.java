@@ -38,7 +38,9 @@ import fr.univreunion.rati.its.ItsTransition;
  * An SCC is ranked iff every transition is eventually peeled. If every reachable
  * non-trivial SCC is ranked (and no reachable transition is
  * {@link ItsTransition#isSupported() unsupported}), the system — hence the
- * program's path length — terminates.
+ * program's path length — terminates. SCCs no ranking stage covers are handed to
+ * {@link NonTermination}, which may turn the verdict into a certified
+ * {@link Verdict#NONTERMINATES} via a reachable recurrent set.
  *
  * <p>Soundness rests on exact rational arithmetic ({@link LinearProgram}): a
  * peeled transition has a Farkas-certified strict positive decrease and a lower
@@ -48,7 +50,13 @@ import fr.univreunion.rati.its.ItsTransition;
  */
 public final class FarkasRanking {
 
-    public enum Verdict { TERMINATES, UNKNOWN }
+    /**
+     * {@code TERMINATES} and {@code NONTERMINATES} both come with a verifiable
+     * certificate; {@code UNKNOWN} claims nothing. {@code NONTERMINATES} is a
+     * statement about the ITS as given — a front-end whose ITS over-approximates
+     * a program may propagate TERMINATES to that program, but never NONTERMINATES.
+     */
+    public enum Verdict { TERMINATES, NONTERMINATES, UNKNOWN }
 
     private static final boolean DEBUG = Boolean.getBoolean("rati.rankingDebug");
 
@@ -65,9 +73,15 @@ public final class FarkasRanking {
     public static final class Certificate {
         public final Verdict verdict;
         public final List<SccProof> sccs;
+        /** Non-null exactly when {@link #verdict} is {@link Verdict#NONTERMINATES}. */
+        public final NonTermination.Witness nonTermination;
         Certificate(Verdict verdict, List<SccProof> sccs) {
+            this(verdict, sccs, null);
+        }
+        Certificate(Verdict verdict, List<SccProof> sccs, NonTermination.Witness nonTermination) {
             this.verdict = verdict;
             this.sccs = sccs;
+            this.nonTermination = nonTermination;
         }
     }
 
@@ -81,29 +95,32 @@ public final class FarkasRanking {
         SccProof(List<String> locations) { this.locations = locations; }
     }
 
-    /** Proves termination AND, on success, collects a {@link Certificate}. */
+    /** Proves termination or non-termination AND collects a {@link Certificate}. */
     public static Certificate proveWithCertificate(IntegerTransitionSystem its, String entryLocation) {
-        List<SccProof> proofs = new ArrayList<SccProof>();
-        Verdict v = prove(its, entryLocation, proofs);
-        return new Certificate(v, proofs);
+        return prove(its, entryLocation, new ArrayList<SccProof>());
     }
 
     public static Verdict prove(IntegerTransitionSystem its, String entryLocation) {
-        return prove(its, entryLocation, null);
+        return prove(its, entryLocation, null).verdict;
     }
 
-    private static Verdict prove(IntegerTransitionSystem its, String entryLocation,
+    private static Certificate prove(IntegerTransitionSystem its, String entryLocation,
             List<SccProof> proofs) {
-        if (entryLocation == null || its.location(entryLocation) == null) return Verdict.UNKNOWN;
+        List<SccProof> outProofs = proofs == null ? new ArrayList<SccProof>() : proofs;
+        if (entryLocation == null || its.location(entryLocation) == null)
+            return new Certificate(Verdict.UNKNOWN, outProofs);
 
         Set<String> reachable = reachableFrom(its, entryLocation);
 
-        // A reachable transition the model could not express faithfully forces a
-        // sound UNKNOWN (it may hide an unranked loop) — unless its guard is
+        // A reachable transition the model could not express faithfully rules a
+        // TERMINATES out (it may hide an unranked loop) — unless its guard is
         // infeasible, in which case it can never fire and cannot hide anything.
+        // Non-termination is still worth attempting: its witness only ever rides
+        // on supported transitions, so unmodelled ones cannot invalidate it.
+        boolean unsupportedReachable = false;
         for (ItsTransition t : its.transitions())
             if (!t.isSupported() && reachable.contains(t.source().name())
-                    && !ItsInvariants.isInfeasible(t)) return Verdict.UNKNOWN;
+                    && !ItsInvariants.isInfeasible(t)) { unsupportedReachable = true; break; }
 
         // SCCs over the reachable sub-graph.
         Map<String, Integer> scc = tarjan(its, reachable);
@@ -121,18 +138,11 @@ public final class FarkasRanking {
         nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
 
         if (DEBUG) {
-            System.err.println("[ranking] entry=" + entryLocation + " reachable=" + reachable.size()
-                    + " nonTrivialSCCs=" + nonTrivial.size());
             int edges = 0;
             for (ItsTransition t : its.transitions())
-                if (reachable.contains(t.source().name()) && reachable.contains(t.target().name())) {
-                    edges++;
-                    if (t.source().name().contains("reverse") || t.target().name().contains("reverse"))
-                        System.err.println("    edge " + t.source().name() + "[scc" + scc.get(t.source().name())
-                                + "] -> " + t.target().name() + "[scc" + scc.get(t.target().name())
-                                + "] supported=" + t.isSupported());
-                }
-            System.err.println("  reachable intra-edges=" + edges);
+                if (reachable.contains(t.source().name()) && reachable.contains(t.target().name())) edges++;
+            System.err.println("[ranking] entry=" + entryLocation + " reachable=" + reachable.size()
+                    + " intra-edges=" + edges + " nonTrivialSCCs=" + nonTrivial.size());
             for (Integer c : nonTrivial) {
                 System.err.println("  SCC#" + c + " cyclic transitions:");
                 for (ItsTransition t : cyclic.get(c))
@@ -140,18 +150,37 @@ public final class FarkasRanking {
                             + "  guard=" + t.constraints());
             }
         }
-        if (nonTrivial.isEmpty()) return Verdict.TERMINATES;   // no loop to rank
+        if (nonTrivial.isEmpty())   // no loop at all: nothing can diverge
+            return new Certificate(unsupportedReachable ? Verdict.UNKNOWN : Verdict.TERMINATES, outProofs);
 
         // Supporting invariants: boundedness of a ranking function often depends on
         // a fact established before the loop, absent from the per-transition guards.
-        Map<String, List<ItsLinearConstraint>> invariants =
-                ItsInvariants.compute(its, entryLocation, reachable);
-
-        for (Integer comp : nonTrivial) {
-            if (rankScc(its, invariants, cyclic.get(comp), proofs) != Verdict.TERMINATES)
-                return Verdict.UNKNOWN;
+        // Invariants only ever ADD premises / seed candidates, so a failure to
+        // compute them must degrade the proof search, not crash it.
+        Map<String, List<ItsLinearConstraint>> invariants;
+        try {
+            invariants = ItsInvariants.compute(its, entryLocation, reachable);
+        } catch (RuntimeException e) {
+            if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
+            invariants = java.util.Collections.emptyMap();
         }
-        return Verdict.TERMINATES;
+
+        // Rank every SCC (pointless when an unsupported transition already bars a
+        // TERMINATES); the unranked ones become non-termination candidates.
+        List<List<ItsTransition>> unranked = new ArrayList<List<ItsTransition>>();
+        for (Integer comp : nonTrivial) {
+            if (unsupportedReachable
+                    || rankScc(its, invariants, cyclic.get(comp), proofs) != Verdict.TERMINATES)
+                unranked.add(cyclic.get(comp));
+        }
+        if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
+
+        for (List<ItsTransition> sccTrans : unranked) {
+            NonTermination.Witness w =
+                    NonTermination.disprove(its, entryLocation, sccTrans, invariants);
+            if (w != null) return new Certificate(Verdict.NONTERMINATES, outProofs, w);
+        }
+        return new Certificate(Verdict.UNKNOWN, outProofs);
     }
 
     // -------------------------------------------------------------------------

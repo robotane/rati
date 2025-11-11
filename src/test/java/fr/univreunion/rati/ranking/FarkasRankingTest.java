@@ -60,27 +60,27 @@ public class FarkasRankingTest {
     }
 
     @Test
-    public void unboundedIncrementIsUnknown() {
-        // L(x) -> L(x+1)  guard true  — diverges, no linear ranking function.
+    public void unboundedIncrementIsNonTerminating() {
+        // L(x) -> L(x+1)  guard true  — diverges; the recurrent-set stage disproves it.
         ItsLocation l = new ItsLocation("L", Arrays.asList("X"));
         IntegerTransitionSystem its = new IntegerTransitionSystem("t", "L");
         its.addLocation(l);
         its.addTransition(new ItsTransition(l, l,
                 java.util.Collections.<ItsLinearConstraint>emptyList(),
                 Arrays.asList(expr(1, "X", 1L))));             // X' = X + 1
-        assertEquals(FarkasRanking.Verdict.UNKNOWN, FarkasRanking.prove(its, "L"));
+        assertEquals(FarkasRanking.Verdict.NONTERMINATES, FarkasRanking.prove(its, "L"));
     }
 
     @Test
-    public void identitySelfLoopIsUnknown() {
-        // L(x) -> L(x)  guard true — stutter, no decrease.
+    public void identitySelfLoopIsNonTerminating() {
+        // L(x) -> L(x)  guard true — stutter: an infinite run, witnessed trivially.
         ItsLocation l = new ItsLocation("L", Arrays.asList("X"));
         IntegerTransitionSystem its = new IntegerTransitionSystem("t", "L");
         its.addLocation(l);
         its.addTransition(new ItsTransition(l, l,
                 java.util.Collections.<ItsLinearConstraint>emptyList(),
                 Arrays.asList(expr(0, "X", 1L))));
-        assertEquals(FarkasRanking.Verdict.UNKNOWN, FarkasRanking.prove(its, "L"));
+        assertEquals(FarkasRanking.Verdict.NONTERMINATES, FarkasRanking.prove(its, "L"));
     }
 
     @Test

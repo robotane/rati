@@ -1,13 +1,16 @@
 package fr.univreunion.rati.rank;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 
+import fr.univreunion.rati.its.ItsTransition;
 import fr.univreunion.rati.ranking.FarkasRanking;
+import fr.univreunion.rati.ranking.NonTermination;
 
 /**
  * Standalone CLI for the in-house Farkas/ADFG termination prover. Reads an
@@ -26,7 +29,8 @@ import fr.univreunion.rati.ranking.FarkasRanking;
  *   java -Djava.library.path=lib -jar rank.jar &lt;file.koat&gt; [--entry F] [--quiet]
  * </pre>
  *
- * <p>Exit code: {@code 0} TERMINATES, {@code 1} UNKNOWN, {@code 2} usage/IO error.
+ * <p>Exit code: {@code 0} TERMINATES, {@code 1} UNKNOWN, {@code 2} usage/IO error,
+ * {@code 3} NONTERMINATES (with a recurrent-set witness).
  */
 public final class RankMain {
 
@@ -54,7 +58,17 @@ public final class RankMain {
             return;
         }
 
-        KoatParser.Parsed parsed = KoatParser.parse(text);
+        KoatParser.Parsed parsed;
+        try {
+            parsed = KoatParser.parse(text);
+        } catch (RuntimeException e) {
+            // A malformed input is a usage error (exit 2), not an analysis outcome:
+            // an uncaught parse exception would leak a stack trace and exit with the
+            // JVM's default 1 — indistinguishable from UNKNOWN for a caller.
+            System.err.println("error: cannot parse " + file + ": " + e.getMessage());
+            System.exit(2);
+            return;
+        }
         String start = entry != null ? entry : parsed.start;
         if (start == null) {
             System.err.println("error: no start functor (no (STARTTERM …) and no --entry given)");
@@ -93,10 +107,43 @@ public final class RankMain {
             System.out.println("TERMINATES");
             if (!quiet) printCertificate(cert);
             System.exit(0);
+        } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES) {
+            System.out.println("NONTERMINATES");
+            if (!quiet) printNonTermination(cert.nonTermination);
+            System.exit(3);
         } else {
             System.out.println("UNKNOWN");
             System.exit(1);
         }
+    }
+
+    private static void printNonTermination(NonTermination.Witness w) {
+        System.out.println("certificate (non-termination):");
+        System.out.println("  location: " + w.location);
+        System.out.println("  recurrent set: { " + String.join(", ", w.recurrentSet) + " }");
+        System.out.println("  cycle: " + edgeChain(w.cycle, w.location));
+        System.out.println("  determinised step: " + String.join(", ", w.loopStep));
+        System.out.println("  path: " + (w.path.isEmpty() ? "(entry is the loop head)"
+                : edgeChain(w.path, w.path.get(0).source().name())));
+        System.out.println("  entry state: " + renderState(w.entryState));
+        System.out.println("  state entering the loop: " + renderState(w.headState));
+    }
+
+    /** {@code a -> b -> c} from a transition list starting at {@code first}. */
+    private static String edgeChain(List<ItsTransition> ts, String first) {
+        StringBuilder sb = new StringBuilder(first);
+        for (ItsTransition t : ts) sb.append(" -> ").append(t.target().name());
+        return sb.toString();
+    }
+
+    private static String renderState(Map<String, BigInteger> state) {
+        if (state.isEmpty()) return "(no variables)";
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, BigInteger> e : state.entrySet()) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(e.getKey()).append(" = ").append(e.getValue());
+        }
+        return sb.toString();
     }
 
     private static void printCertificate(FarkasRanking.Certificate cert) {
@@ -122,7 +169,9 @@ public final class RankMain {
     private static void usage(String err) {
         if (err != null) System.err.println("error: " + err);
         System.err.println("usage: rank <file.koat> [--entry <functor>] [--quiet]");
-        System.err.println("  reads a KoAT-format ITS, prints TERMINATES (+ ranking certificate) or UNKNOWN");
+        System.err.println("  reads a KoAT-format ITS, prints TERMINATES (+ ranking certificate),");
+        System.err.println("  NONTERMINATES (+ recurrent-set witness) or UNKNOWN");
+        System.err.println("  exit code: 0 TERMINATES, 1 UNKNOWN, 2 usage/IO error, 3 NONTERMINATES");
         System.err.println("  run with -Djava.library.path=<dir with libjapron.so> (Apron JNI)");
         System.exit(2);
     }
