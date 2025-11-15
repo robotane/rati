@@ -318,77 +318,79 @@ public final class KoatParser {
     }
 
     /**
-     * Parses a linear expression like {@code -LI0 + LO0}, {@code LI2 - LO2 - 1},
-     * {@code 2*LI0 + 3}, {@code LO1} or {@code 0} — the {@link
-     * ItsLinearExpression#toString()} grammar. Terms are separated by {@code +}/
-     * {@code -} (a leading {@code -} is a sign), a term is {@code [coeff*]var} or a
-     * bare integer.
+     * Parses a linear expression — {@code -LI0 + LO0}, {@code LI2-LO2-1},
+     * {@code 2*A + 3}, {@code A*2}, {@code 0} — by tokenising character by
+     * character, so the wild KoAT variants <em>without</em> spaces around
+     * {@code +}/{@code -} parse too (the old spaced-operator splitter rejected
+     * them). Grammar: {@code expr := sign* term (sign+ term)*},
+     * {@code term := factor ('*' factor)*}, {@code factor := integer | identifier}.
+     * A term with two identifier factors ({@code A*B}) is non-affine:
+     * {@link NonlinearException}. Anything else unexpected is rejected loudly —
+     * never a silently invented phantom variable, which would make the guard
+     * vacuous and the verdict inexplicable.
      */
     static ItsLinearExpression parseExpr(String expr) {
         ItsLinearExpression.Builder b = new ItsLinearExpression.Builder();
-        String s = expr.trim();
-        if (s.isEmpty()) return b.build();
-        // Normalise separators: " - " becomes " + -", " + " stays, so a split on
-        // " + " yields signed tokens; a leading "-term" keeps its sign.
-        s = s.replace(" - ", " + -").replace(" + ", " + ");
-        for (String tok : s.split(" \\+ ")) {
-            String t = tok.trim();
-            if (t.isEmpty()) continue;
+        String s = expr;
+        int i = 0;
+        final int n = s.length();
+        boolean afterTerm = false;     // a term just ended and no sign was seen since
+        while (true) {
+            while (i < n && Character.isWhitespace(s.charAt(i))) i++;
+            if (i >= n) break;
             long sign = 1;
-            while (t.startsWith("-") || t.startsWith("+")) {
-                if (t.startsWith("-")) sign = -sign;
-                t = t.substring(1).trim();
+            boolean sawSign = false;
+            while (i < n) {
+                char c = s.charAt(i);
+                if (c == '-') { sign = -sign; i++; sawSign = true; }
+                else if (c == '+') { i++; sawSign = true; }
+                else if (Character.isWhitespace(c)) i++;
+                else break;
             }
-            if (t.isEmpty()) continue;
-            int star = t.indexOf('*');
-            if (star >= 0) {
-                String left = t.substring(0, star).trim();
-                String right = t.substring(star + 1).trim();
-                // Accept coeff*var, var*coeff and const*const; reject var*var and
-                // products of three or more factors (non-affine — no linear model).
-                if (right.indexOf('*') >= 0) throw new NonlinearException(t);
-                if (isInteger(left) && !isInteger(right)) b.addTerm(right, sign * Long.parseLong(left));
-                else if (isInteger(right) && !isInteger(left)) b.addTerm(left, sign * Long.parseLong(right));
-                else if (isInteger(left) && isInteger(right))
-                    b.addConstant(sign * Long.parseLong(left) * Long.parseLong(right));
-                else throw new NonlinearException(t);
-            } else if (isInteger(t)) {
-                b.addConstant(sign * Long.parseLong(t));
-            } else if (isVariable(t)) {
-                b.addTerm(t, sign);
-            } else {
-                // Not an integer, not a well-formed identifier: e.g. an operator-free
-                // expression "LI2-LO2-1" (no spaces around the minus) that the grammar
-                // never tokenised, or a stray comparison fragment "A<" from a
-                // mis-split operator. Reject it loudly rather than silently inventing a
-                // phantom variable (which would make the guard vacuous and the verdict
-                // inexplicable). KoAT/ItsLinearExpression separates terms by " + "/" - ".
-                throw new IllegalArgumentException(
-                        "malformed term '" + t + "' in expression '" + expr
-                        + "' (expected [coeff*]<identifier> or an integer, "
-                        + "terms separated by ' + ' / ' - ')");
+            if (i >= n) {
+                if (sawSign) throw malformed(expr, "dangling sign");
+                break;
             }
+            if (afterTerm && !sawSign) throw malformed(expr, "missing '+'/'-' between terms");
+            int termStart = i;
+            long coeff = 1;
+            String var = null;
+            while (true) {                                    // factor ('*' factor)*
+                char c = s.charAt(i);
+                if (Character.isDigit(c)) {
+                    int fs = i;
+                    while (i < n && Character.isDigit(s.charAt(i))) i++;
+                    try {
+                        coeff = Math.multiplyExact(coeff, Long.parseLong(s.substring(fs, i)));
+                    } catch (NumberFormatException e) {
+                        throw malformed(expr, "integer literal out of range");
+                    }
+                } else if (Character.isLetter(c) || c == '_') {
+                    int fs = i;
+                    while (i < n && (Character.isLetterOrDigit(s.charAt(i)) || s.charAt(i) == '_')) i++;
+                    if (var != null) throw new NonlinearException(s.substring(termStart, i).trim());
+                    var = s.substring(fs, i);
+                } else {
+                    throw malformed(expr, "unexpected character '" + c + "'");
+                }
+                int j = i;
+                while (j < n && Character.isWhitespace(s.charAt(j))) j++;
+                if (j < n && s.charAt(j) == '*') {
+                    i = j + 1;
+                    while (i < n && Character.isWhitespace(s.charAt(i))) i++;
+                    if (i >= n) throw malformed(expr, "dangling '*'");
+                    continue;
+                }
+                break;
+            }
+            if (var == null) b.addConstant(Math.multiplyExact(sign, coeff));
+            else b.addTerm(var, Math.multiplyExact(sign, coeff));
+            afterTerm = true;
         }
         return b.build();
     }
 
-    private static boolean isInteger(String s) {
-        if (s.isEmpty()) return false;
-        for (int i = 0; i < s.length(); i++) {
-            if (!Character.isDigit(s.charAt(i))) return false;
-        }
-        return true;
-    }
-
-    /** A KoAT variable identifier: {@code [A-Za-z_][A-Za-z0-9_]*}. */
-    private static boolean isVariable(String s) {
-        if (s.isEmpty()) return false;
-        char c0 = s.charAt(0);
-        if (!Character.isLetter(c0) && c0 != '_') return false;
-        for (int i = 1; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (!Character.isLetterOrDigit(c) && c != '_') return false;
-        }
-        return true;
+    private static IllegalArgumentException malformed(String expr, String why) {
+        return new IllegalArgumentException("malformed expression '" + expr + "': " + why);
     }
 }

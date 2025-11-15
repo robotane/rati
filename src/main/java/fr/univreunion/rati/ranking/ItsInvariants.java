@@ -1,9 +1,11 @@
 package fr.univreunion.rati.ranking;
 
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -11,15 +13,11 @@ import java.util.Set;
 
 import apron.Abstract1;
 import apron.ApronException;
-import apron.Coeff;
 import apron.Environment;
 import apron.Lincons1;
 import apron.Linexpr1;
-import apron.Linterm1;
 import apron.Manager;
-import apron.MpqScalar;
 import apron.Polka;
-import apron.Scalar;
 
 import fr.univreunion.rati.its.IntegerTransitionSystem;
 import fr.univreunion.rati.its.ItsLinearConstraint;
@@ -75,7 +73,7 @@ public final class ItsInvariants {
             Environment env = new Environment(new String[0], names.toArray(new String[0]));
             Abstract1 a = new Abstract1(man, env);   // ⊤
             List<Lincons1> cons = new ArrayList<Lincons1>();
-            for (ItsLinearConstraint c : t.constraints()) cons.add(toLincons(env, c));
+            for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(env, c));
             if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
             return a.isBottom(man);
         } catch (ApronException e) {
@@ -103,30 +101,25 @@ public final class ItsInvariants {
             Environment env = new Environment(new String[0], names.toArray(new String[0]));
             Abstract1 a = new Abstract1(man, env);   // ⊤
             List<Lincons1> cons = new ArrayList<Lincons1>();
-            if (premises != null) for (ItsLinearExpression p : premises) cons.add(geLincons(env, p));
+            if (premises != null)
+                for (ItsLinearExpression p : premises) cons.add(ApronBridge.geLincons(env, p));
             if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
             // Meet with ρ ≤ −1, encoded as −ρ − 1 ≥ 0 (Apron SUPEQ). The non-strict
             // form is exact over integers — ρ here is integer-scaled, so ρ ≥ 0 over
             // ℤ iff no integer point has ρ ≤ −1 — and, unlike a strict SUP, is not
             // silently relaxed by the loose (non-strict) Polka domain used here.
-            List<Linterm1> terms = new ArrayList<Linterm1>();
+            // Built in BigInteger: ρ's coefficients are lcm-scaled LP values, exactly
+            // the kind an (int) cast would silently truncate.
+            Map<String, BigInteger> neg = new LinkedHashMap<String, BigInteger>();
             for (Map.Entry<String, Long> e : rhoTerms.entrySet())
-                terms.add(new Linterm1(e.getKey(), new MpqScalar((int) -e.getValue())));
-            Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) (-rhoConst - 1)));
+                neg.put(e.getKey(), BigInteger.valueOf(e.getValue()).negate());
+            Linexpr1 le = ApronBridge.linexpr(env, neg,
+                    BigInteger.valueOf(rhoConst).negate().subtract(BigInteger.ONE));
             a = a.meetCopy(man, new Lincons1(Lincons1.SUPEQ, le));
             return a.isBottom(man);
         } catch (ApronException e) {
             return false;   // could not prove ρ ≥ 0 ⇒ do not peel (sound)
         }
-    }
-
-    /** {@code expr ≥ 0} as an Apron constraint over {@code env}. */
-    private static Lincons1 geLincons(Environment env, ItsLinearExpression expr) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        for (Map.Entry<String, Long> e : expr.coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) (long) e.getValue())));
-        Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) expr.constant()));
-        return new Lincons1(Lincons1.SUPEQ, le);
     }
 
     private Map<String, List<ItsLinearConstraint>> run(
@@ -148,10 +141,13 @@ public final class ItsInvariants {
 
             Map<String, Integer> visits = new HashMap<String, Integer>();
             Deque<String> work = new ArrayDeque<String>();
+            Set<String> inWork = new java.util.HashSet<String>();   // O(1) membership, vs O(n) Deque.contains
             work.add(entry);
+            inWork.add(entry);
             int budget = 200 * Math.max(1, reachable.size());   // safety net (widening already bounds)
             while (!work.isEmpty() && budget-- > 0) {
                 String loc = work.poll();
+                inWork.remove(loc);
                 Abstract1 src = inv.get(loc);
                 if (src.isBottom(man)) continue;
                 for (ItsTransition t : bySource.getOrDefault(loc, java.util.Collections.emptyList())) {
@@ -164,7 +160,7 @@ public final class ItsInvariants {
                     if (v > WIDEN_DELAY) joined = old.widening(man, joined);
                     if (!joined.isIncluded(man, old)) {   // grew ⇒ propagate
                         inv.put(tgt, joined);
-                        if (!work.contains(tgt)) work.add(tgt);
+                        if (inWork.add(tgt)) work.add(tgt);
                     }
                 }
             }
@@ -174,7 +170,9 @@ public final class ItsInvariants {
             // monotone transfer to a post-fixpoint stays sound and only tightens.
             descend(its, entry, reachable, bySource, inv);
 
-            for (String loc : reachable) out.put(loc, toConstraints(inv.get(loc)));
+            // Exact read-back; a conjunct beyond the long model is dropped, which
+            // only weakens the invariant — the sound direction for a premise.
+            for (String loc : reachable) out.put(loc, ApronBridge.toConstraints(man, inv.get(loc)));
         } catch (ApronException e) {
             throw new RuntimeException(e);
         }
@@ -229,8 +227,9 @@ public final class ItsInvariants {
         Abstract1 a = src.changeEnvironmentCopy(man, full, false);
 
         List<Lincons1> cons = new ArrayList<Lincons1>();
-        for (ItsLinearConstraint c : t.constraints()) cons.add(toLincons(full, c));
-        for (int j = 0; j < res.length; j++) cons.add(resEq(full, res[j], t.updates().get(j)));
+        for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(full, c));
+        for (int j = 0; j < res.length; j++)
+            cons.add(ApronBridge.bindEq(full, res[j], t.updates().get(j)));
         a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
 
         // Project onto the result vars, then rename them to the target formals.
@@ -247,54 +246,4 @@ public final class ItsInvariants {
         return new Environment(new String[0], loc.variables().toArray(new String[0]));
     }
 
-    /** {@code __res - expr = 0}. */
-    private static Lincons1 resEq(Environment env, String res, ItsLinearExpression expr) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        terms.add(new Linterm1(res, new MpqScalar(1)));
-        for (Map.Entry<String, Long> e : expr.coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) -e.getValue())));
-        Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) -expr.constant()));
-        return new Lincons1(Lincons1.EQ, le);
-    }
-
-    private static Lincons1 toLincons(Environment env, ItsLinearConstraint c) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        for (Map.Entry<String, Long> e : c.lhs().coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) (long) e.getValue())));
-        Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) c.lhs().constant()));
-        int kind = c.op() == ItsLinearConstraint.Op.EQ ? Lincons1.EQ
-                 : c.op() == ItsLinearConstraint.Op.GT ? Lincons1.SUP : Lincons1.SUPEQ;
-        return new Lincons1(kind, le);
-    }
-
-    /** Reads an Apron polyhedron back as ITS constraints over the same variable names. */
-    private List<ItsLinearConstraint> toConstraints(Abstract1 a) throws ApronException {
-        List<ItsLinearConstraint> out = new ArrayList<ItsLinearConstraint>();
-        if (a.isBottom(man) || a.isTop(man)) return out;
-        for (Lincons1 lc : a.toLincons(man)) {
-            ItsLinearConstraint.Op op = ItsLinearConstraint.opFromApron(lc.getKind());
-            if (op == null) continue;
-            ItsLinearExpression.Builder b = new ItsLinearExpression.Builder();
-            b.addConstant(scalarToLong(lc.getCst()));
-            boolean anyVar = false;
-            for (Linterm1 lt : lc.getLinterms()) {
-                long co = scalarToLong(lt.getCoefficient());
-                if (co == 0) continue;
-                anyVar = true;
-                b.addTerm(lt.getVariable().toString(), co);
-            }
-            if (!anyVar) continue;   // pure-constant facet carries no ranking information
-            out.add(new ItsLinearConstraint(b.build(), op));
-        }
-        return out;
-    }
-
-    private static long scalarToLong(Coeff c) {
-        if (c instanceof Scalar) {
-            double[] d = new double[1];
-            ((Scalar) c).toDouble(d, 0);
-            return Math.round(d[0]);
-        }
-        return 0;
-    }
 }

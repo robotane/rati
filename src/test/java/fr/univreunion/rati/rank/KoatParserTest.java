@@ -92,11 +92,16 @@ public class KoatParserTest {
         assertEquals(5L, c.lhs().constant());
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void rejectsPhantomVariableFromMissingSpaces() {
-        // No spaces around the minus: the grammar never tokenises it, so the whole
-        // string would have become a phantom variable "LI2-LO2-1" — now rejected.
-        KoatParser.parseExpr("LI2-LO2-1");
+    @Test
+    public void unspacedMinusParsesToTheRealForm_notAPhantomVariable() {
+        // No spaces around the minus: the old spaced-operator splitter could only
+        // reject this (the phantom-variable hazard); the tokenising parser reads
+        // the intended linear form instead. See KoatExprTest for the full grammar.
+        fr.univreunion.rati.its.ItsLinearExpression e = KoatParser.parseExpr("LI2-LO2-1");
+        assertEquals(1L, e.coefficient("LI2"));
+        assertEquals(-1L, e.coefficient("LO2"));
+        assertEquals(-1L, e.constant());
+        assertEquals(2, e.variables().size());
     }
 
     @Test(expected = IllegalArgumentException.class)

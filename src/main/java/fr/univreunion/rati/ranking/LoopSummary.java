@@ -8,15 +8,10 @@ import java.util.Set;
 
 import apron.Abstract1;
 import apron.ApronException;
-import apron.Coeff;
 import apron.Environment;
 import apron.Lincons1;
-import apron.Linexpr1;
-import apron.Linterm1;
 import apron.Manager;
-import apron.MpqScalar;
 import apron.Polka;
-import apron.Scalar;
 
 import fr.univreunion.rati.its.ItsLinearConstraint;
 import fr.univreunion.rati.its.ItsLinearExpression;
@@ -142,8 +137,8 @@ public final class LoopSummary {
 
         Environment env = new Environment(new String[0], names.toArray(new String[0]));
         List<Lincons1> cs = new ArrayList<Lincons1>();
-        for (ItsLinearConstraint c : t.constraints()) cs.add(toLincons(env, c));
-        for (int j = 0; j < q; j++) cs.add(bindEq(env, ro[j], t.updates().get(j)));
+        for (ItsLinearConstraint c : t.constraints()) cs.add(ApronBridge.toLincons(env, c));
+        for (int j = 0; j < q; j++) cs.add(ApronBridge.bindEq(env, ro[j], t.updates().get(j)));
         Abstract1 a = new Abstract1(man, env).meetCopy(man, cs.toArray(new Lincons1[0]));
 
         // Keep only source formals + ro_j, then rename source formals to __ri_i.
@@ -189,7 +184,10 @@ public final class LoopSummary {
         for (int j = 0; j < q; j++) { roFrom[j] = OUT + j; roTo[j] = "z" + j; }
         if (q > 0) a = a.renameCopy(man, roFrom, roTo);
 
-        List<ItsLinearConstraint> cons = toConstraints(a);
+        // Exact read-back; a conjunct beyond the long model is dropped, which
+        // ENLARGES the summary relation — sound here, because the summary is only
+        // ever used to PROVE termination of a superset of the real relation.
+        List<ItsLinearConstraint> cons = ApronBridge.toConstraints(man, a);
         List<ItsLinearExpression> updates = new ArrayList<ItsLinearExpression>();
         for (int j = 0; j < q; j++) updates.add(ItsLinearExpression.variable("z" + j));
         return new ItsTransition(e.src, e.tgt, cons, updates);
@@ -217,55 +215,5 @@ public final class LoopSummary {
         System.arraycopy(a, 0, r, 0, a.length);
         System.arraycopy(b, 0, r, a.length, b.length);
         return r;
-    }
-
-    /** {@code var - expr = 0}. */
-    private static Lincons1 bindEq(Environment env, String var, ItsLinearExpression expr) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        terms.add(new Linterm1(var, new MpqScalar(1)));
-        for (Map.Entry<String, Long> e : expr.coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) -e.getValue())));
-        return new Lincons1(Lincons1.EQ, new Linexpr1(env, terms.toArray(new Linterm1[0]),
-                new MpqScalar((int) -expr.constant())));
-    }
-
-    private static Lincons1 toLincons(Environment env, ItsLinearConstraint c) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        for (Map.Entry<String, Long> e : c.lhs().coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) (long) e.getValue())));
-        Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) c.lhs().constant()));
-        int kind = c.op() == ItsLinearConstraint.Op.EQ ? Lincons1.EQ
-                 : c.op() == ItsLinearConstraint.Op.GT ? Lincons1.SUP : Lincons1.SUPEQ;
-        return new Lincons1(kind, le);
-    }
-
-    private List<ItsLinearConstraint> toConstraints(Abstract1 a) throws ApronException {
-        List<ItsLinearConstraint> out = new ArrayList<ItsLinearConstraint>();
-        if (a.isBottom(man) || a.isTop(man)) return out;
-        for (Lincons1 lc : a.toLincons(man)) {
-            ItsLinearConstraint.Op op = ItsLinearConstraint.opFromApron(lc.getKind());
-            if (op == null) continue;
-            ItsLinearExpression.Builder b = new ItsLinearExpression.Builder();
-            b.addConstant(scalarToLong(lc.getCst()));
-            boolean anyVar = false;
-            for (Linterm1 lt : lc.getLinterms()) {
-                long co = scalarToLong(lt.getCoefficient());
-                if (co == 0) continue;
-                anyVar = true;
-                b.addTerm(lt.getVariable().toString(), co);
-            }
-            if (!anyVar) continue;
-            out.add(new ItsLinearConstraint(b.build(), op));
-        }
-        return out;
-    }
-
-    private static long scalarToLong(Coeff c) {
-        if (c instanceof Scalar) {
-            double[] d = new double[1];
-            ((Scalar) c).toDouble(d, 0);
-            return Math.round(d[0]);
-        }
-        return 0;
     }
 }

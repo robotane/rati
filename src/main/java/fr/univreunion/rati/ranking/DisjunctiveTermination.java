@@ -3,20 +3,16 @@ package fr.univreunion.rati.ranking;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import apron.Abstract1;
 import apron.ApronException;
-import apron.Coeff;
 import apron.Environment;
 import apron.Lincons1;
 import apron.Linexpr1;
 import apron.Linterm1;
 import apron.Manager;
-import apron.MpqScalar;
 import apron.Polka;
-import apron.Scalar;
 
 import fr.univreunion.rati.its.ItsLinearConstraint;
 import fr.univreunion.rati.its.ItsLinearExpression;
@@ -134,8 +130,8 @@ final class DisjunctiveTermination {
 
         Environment env = new Environment(new String[0], names.toArray(new String[0]));
         List<Lincons1> cs = new ArrayList<Lincons1>();
-        for (ItsLinearConstraint c : t.constraints()) cs.add(toLincons(env, c.lhs(), c.op()));
-        for (int k = 0; k < n; k++) cs.add(bindEq(env, o[k], t.updates().get(k)));
+        for (ItsLinearConstraint c : t.constraints()) cs.add(ApronBridge.toLincons(env, c));
+        for (int k = 0; k < n; k++) cs.add(ApronBridge.bindEq(env, o[k], t.updates().get(k)));
         Abstract1 a = new Abstract1(man, env).meetCopy(man, cs.toArray(new Lincons1[0]));
 
         String[] keep = new String[2 * n];
@@ -179,12 +175,16 @@ final class DisjunctiveTermination {
      */
     private Abstract1 rankRelation(Abstract1 rel) throws ApronException {
         Lincons1[] cons = rel.toLincons(man);
-        // Premises p ≥ 0 over {i_*, o_*}; an equality contributes p and −p.
-        List<double[]> prem = new ArrayList<double[]>();   // each: [coeff_i0..,coeff_o0..,const]
+        // Premises p ≥ 0 over {i_*, o_*}, read EXACTLY; an equality contributes p
+        // and −p. An unreadable premise (non-rational scalar) is skipped — fewer
+        // premises only make the Farkas synthesis harder, never wrong, and the
+        // returned relation stays well-founded by construction.
+        List<Rational[]> prem = new ArrayList<Rational[]>();   // each: [coeff_i0..,coeff_o0..,const]
         for (Lincons1 lc : cons) {
             ItsLinearConstraint.Op op = ItsLinearConstraint.opFromApron(lc.getKind());
             if (op == null) continue;
-            double[] p = linconsToVec(lc);
+            Rational[] p = linconsToVec(lc);
+            if (p == null) continue;
             prem.add(p);
             if (op == ItsLinearConstraint.Op.EQ) prem.add(negVec(p));
         }
@@ -194,7 +194,7 @@ final class DisjunctiveTermination {
     }
 
     /** LP: find f-coeffs c (length n+1) s.t. premises ⊨ f(i)≥0 and ⊨ f(i)−f(o)−1≥0. */
-    private Rational[] solveFarkasLRF(List<double[]> prem) {
+    private Rational[] solveFarkasLRF(List<Rational[]> prem) {
         // Unknowns: c_0..c_n split into pos/neg (free), then per-implication μ's.
         // Vars over Farkas universe V = {i_0..i_{n-1}, o_0..o_{n-1}} (2n) + const slot.
         int cPos = 0, cNeg = (n + 1);
@@ -211,18 +211,18 @@ final class DisjunctiveTermination {
             Rational[] row = new Rational[total];
             zero(row);
             row[cPos + k] = Rational.ONE; row[cNeg + k] = Rational.of(-1);     // c_k
-            for (int l = 0; l < p; l++) row[muA + l] = Rational.of(-(long) prem.get(l)[k]);
+            for (int l = 0; l < p; l++) row[muA + l] = prem.get(l)[k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
         for (int k = 0; k < n; k++) {        // o_k : f(i) has 0
             Rational[] row = new Rational[total]; zero(row);
-            for (int l = 0; l < p; l++) row[muA + l] = Rational.of(-(long) prem.get(l)[n + k]);
+            for (int l = 0; l < p; l++) row[muA + l] = prem.get(l)[n + k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
         { // const slot: c_n = Σ μa_l const_l + μa0
             Rational[] row = new Rational[total]; zero(row);
             row[cPos + n] = Rational.ONE; row[cNeg + n] = Rational.of(-1);
-            for (int l = 0; l < p; l++) row[muA + l] = Rational.of(-(long) prem.get(l)[2 * n]);
+            for (int l = 0; l < p; l++) row[muA + l] = prem.get(l)[2 * n].negate();
             row[muA0] = Rational.of(-1);
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
@@ -230,18 +230,18 @@ final class DisjunctiveTermination {
         for (int k = 0; k < n; k++) {        // i_k : coeff c_k
             Rational[] row = new Rational[total]; zero(row);
             row[cPos + k] = Rational.ONE; row[cNeg + k] = Rational.of(-1);
-            for (int l = 0; l < p; l++) row[muB + l] = Rational.of(-(long) prem.get(l)[k]);
+            for (int l = 0; l < p; l++) row[muB + l] = prem.get(l)[k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
         for (int k = 0; k < n; k++) {        // o_k : coeff −c_k
             Rational[] row = new Rational[total]; zero(row);
             row[cPos + k] = Rational.of(-1); row[cNeg + k] = Rational.ONE;
-            for (int l = 0; l < p; l++) row[muB + l] = Rational.of(-(long) prem.get(l)[n + k]);
+            for (int l = 0; l < p; l++) row[muB + l] = prem.get(l)[n + k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
         { // const slot: −1 = Σ μb_l const_l + μb0   →   0·c − Σμb const − μb0 = 1
             Rational[] row = new Rational[total]; zero(row);
-            for (int l = 0; l < p; l++) row[muB + l] = Rational.of(-(long) prem.get(l)[2 * n]);
+            for (int l = 0; l < p; l++) row[muB + l] = prem.get(l)[2 * n].negate();
             row[muB0] = Rational.of(-1);
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ONE);
         }
@@ -255,18 +255,19 @@ final class DisjunctiveTermination {
     /** The well-founded relation {@code {f(i) ≥ 0 ∧ f(i) − f(o) ≥ 1}} over {@code i_*,o_*}. */
     private Abstract1 wfRelation(Rational[] c) throws ApronException {
         Environment env = ioEnv();
-        long d = lcmDen(c);
-        // bound: Σ (d·c_k) i_k + d·c_n ≥ 0
+        // Apron scalars are exact rationals: no integer scaling (and no (int)
+        // truncation) is needed — f's coefficients are used verbatim.
         Linterm1[] b = new Linterm1[n];
-        for (int k = 0; k < n; k++) b[k] = new Linterm1(IN + k, new MpqScalar(scaled(c[k], d)));
-        Lincons1 bound = new Lincons1(Lincons1.SUPEQ, new Linexpr1(env, b, new MpqScalar(scaled(c[n], d))));
-        // decrease: Σ d·c_k (i_k − o_k) − d ≥ 0
+        for (int k = 0; k < n; k++) b[k] = new Linterm1(IN + k, ApronBridge.scalar(c[k]));
+        Lincons1 bound = new Lincons1(Lincons1.SUPEQ, new Linexpr1(env, b, ApronBridge.scalar(c[n])));
+        // decrease: Σ c_k (i_k − o_k) − 1 ≥ 0
         Linterm1[] de = new Linterm1[2 * n];
         for (int k = 0; k < n; k++) {
-            de[k] = new Linterm1(IN + k, new MpqScalar(scaled(c[k], d)));
-            de[n + k] = new Linterm1(OUT + k, new MpqScalar(-scaled(c[k], d)));
+            de[k] = new Linterm1(IN + k, ApronBridge.scalar(c[k]));
+            de[n + k] = new Linterm1(OUT + k, ApronBridge.scalar(c[k].negate()));
         }
-        Lincons1 decr = new Lincons1(Lincons1.SUPEQ, new Linexpr1(env, de, new MpqScalar((int) -d)));
+        Lincons1 decr = new Lincons1(Lincons1.SUPEQ,
+                new Linexpr1(env, de, ApronBridge.scalar(Rational.of(-1))));
         return new Abstract1(man, env).meetCopy(man, new Lincons1[]{bound, decr});
     }
 
@@ -299,16 +300,25 @@ final class DisjunctiveTermination {
         return cells.isEmpty() ? null : cells.get(0);
     }
 
-    /** Strict negation of {@code e ▷ 0} (▷ ∈ {≥,>}): {@code −e > 0}. */
+    /**
+     * Strict negation of {@code e ▷ 0} (▷ ∈ {≥,>}): {@code −e > 0}, exactly.
+     * A rounded negation would shrink the complement and could hide an escaping
+     * region (an unsound "covered"), so an unreadable facet aborts the whole
+     * disjunctive attempt (caught in {@link #terminates} — a sound false).
+     */
     private Lincons1 strictNegation(Lincons1 lc) throws ApronException {
         Environment env = lc.getEnvironment();
         List<Linterm1> terms = new ArrayList<Linterm1>();
         for (Linterm1 lt : lc.getLinterms()) {
-            long co = scalarToLong(lt.getCoefficient());
-            if (co != 0) terms.add(new Linterm1(lt.getVariable().toString(), new MpqScalar((int) -co)));
+            Rational co = ApronBridge.coeffToRational(lt.getCoefficient());
+            if (co == null) throw new IllegalStateException("non-rational facet: " + lc);
+            if (!co.isZero())
+                terms.add(new Linterm1(lt.getVariable().toString(), ApronBridge.scalar(co.negate())));
         }
-        long cst = scalarToLong(lc.getCst());
-        return new Lincons1(Lincons1.SUP, new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) -cst)));
+        Rational cst = ApronBridge.coeffToRational(lc.getCst());
+        if (cst == null) throw new IllegalStateException("non-rational facet: " + lc);
+        return new Lincons1(Lincons1.SUP,
+                new Linexpr1(env, terms.toArray(new Linterm1[0]), ApronBridge.scalar(cst.negate())));
     }
 
     // -------------------------------------------------------------------------
@@ -321,13 +331,20 @@ final class DisjunctiveTermination {
         return new Environment(new String[0], v);
     }
 
-    private double[] linconsToVec(Lincons1 lc) {
-        double[] v = new double[2 * n + 1];
+    /** Exact premise vector of a facet ({@code [i_0.., o_0.., const]}), or null if unreadable. */
+    private Rational[] linconsToVec(Lincons1 lc) {
+        Rational[] v = new Rational[2 * n + 1];
+        java.util.Arrays.fill(v, Rational.ZERO);
         for (Linterm1 lt : lc.getLinterms()) {
             int idx = varIndex(lt.getVariable().toString());
-            if (idx >= 0) v[idx] = scalarToLong(lt.getCoefficient());
+            if (idx < 0) continue;
+            Rational r = ApronBridge.coeffToRational(lt.getCoefficient());
+            if (r == null) return null;
+            v[idx] = r;
         }
-        v[2 * n] = scalarToLong(lc.getCst());
+        Rational cst = ApronBridge.coeffToRational(lc.getCst());
+        if (cst == null) return null;
+        v[2 * n] = cst;
         return v;
     }
 
@@ -337,52 +354,13 @@ final class DisjunctiveTermination {
         return -1;
     }
 
-    private static double[] negVec(double[] v) {
-        double[] r = new double[v.length];
-        for (int i = 0; i < v.length; i++) r[i] = -v[i];
+    private static Rational[] negVec(Rational[] v) {
+        Rational[] r = new Rational[v.length];
+        for (int i = 0; i < v.length; i++) r[i] = v[i].negate();
         return r;
     }
 
     private static void zero(Rational[] row) {
         for (int i = 0; i < row.length; i++) row[i] = Rational.ZERO;
-    }
-
-    private static long lcmDen(Rational[] c) {
-        long d = 1;
-        for (Rational r : c) d = lcm(d, r.denominator().longValueExact());
-        return d;
-    }
-    private static long lcm(long a, long b) { return a / gcd(a, b) * b; }
-    private static long gcd(long a, long b) { a = Math.abs(a); b = Math.abs(b); while (b != 0) { long t = b; b = a % b; a = t; } return a == 0 ? 1 : a; }
-    private static int scaled(Rational r, long d) {
-        return (int) (r.numerator().longValueExact() * (d / r.denominator().longValueExact()));
-    }
-
-    private static Lincons1 bindEq(Environment env, String var, ItsLinearExpression expr) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        terms.add(new Linterm1(var, new MpqScalar(1)));
-        for (Map.Entry<String, Long> e : expr.coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) -e.getValue())));
-        return new Lincons1(Lincons1.EQ, new Linexpr1(env, terms.toArray(new Linterm1[0]),
-                new MpqScalar((int) -expr.constant())));
-    }
-
-    private static Lincons1 toLincons(Environment env, ItsLinearExpression lhs, ItsLinearConstraint.Op op) {
-        List<Linterm1> terms = new ArrayList<Linterm1>();
-        for (Map.Entry<String, Long> e : lhs.coefficients().entrySet())
-            terms.add(new Linterm1(e.getKey(), new MpqScalar((int) (long) e.getValue())));
-        Linexpr1 le = new Linexpr1(env, terms.toArray(new Linterm1[0]), new MpqScalar((int) lhs.constant()));
-        int kind = op == ItsLinearConstraint.Op.EQ ? Lincons1.EQ
-                 : op == ItsLinearConstraint.Op.GT ? Lincons1.SUP : Lincons1.SUPEQ;
-        return new Lincons1(kind, le);
-    }
-
-    private static long scalarToLong(Coeff c) {
-        if (c instanceof Scalar) {
-            double[] d = new double[1];
-            ((Scalar) c).toDouble(d, 0);
-            return Math.round(d[0]);
-        }
-        return 0;
     }
 }
