@@ -20,8 +20,8 @@ import fr.univreunion.rati.its.ItsTransition;
 
 /**
  * In-house linear-ranking-function synthesiser for an {@link IntegerTransitionSystem}
- * — the local fallback that lifts cTI's level-mapping blind spots (free-variable
- * callee atoms, multi-predicate SCC conflation) without an external tool.
+ * — a self-contained ranking engine (handling free-variable callee atoms and
+ * multi-predicate SCCs) that needs no external tool.
  *
  * <p>Implements the SAS&nbsp;2010 algorithm of Alias, Darte, Feautrier &amp; Gonnord,
  * <em>"Multi-dimensional Rankings, Program Termination, and Complexity Bounds of

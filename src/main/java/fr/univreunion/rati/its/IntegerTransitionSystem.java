@@ -17,7 +17,7 @@ import java.util.Map;
  * {@code H :- C.} contributes a location with no outgoing transition. From this
  * one representation we print:
  * <ul>
- *   <li>CLP(PL) for cTI (round-trips the existing export, validating the IR);</li>
+ *   <li>CLP(PL) Prolog clauses (round-tripping the textual export, validating the IR);</li>
  *   <li>an iRankFinder integer-transition-system for ranking-function synthesis;</li>
  *   <li>a KoAT system for complexity bounds.</li>
  * </ul>

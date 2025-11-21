@@ -8,10 +8,9 @@ import java.util.Set;
 /**
  * An integer linear expression {@code c0 + Σ c_v · v} over named variables.
  *
- * <p>This is the structured counterpart of the textual constraints that
- * {@link fr.univreunion.rati.clp.PolyToClp} renders for cTI: instead of a
- * Prolog string it keeps the coefficients explicitly, so backends that consume
- * an Integer Transition System (iRankFinder, KoAT) can read the relation
+ * <p>This is the structured counterpart of a textual (Prolog-style) constraint:
+ * instead of a string it keeps the coefficients explicitly, so backends that
+ * consume an Integer Transition System (iRankFinder, KoAT) can read the relation
  * symbolically rather than re-parsing text. Immutable; build with
  * {@link Builder} or the static factories.
  */
