@@ -82,6 +82,42 @@ public final class ItsInvariants {
     }
 
     /**
+     * True when {@code t} can never fire from a state satisfying its source
+     * location's invariant — i.e. {@code srcInvariant ∧ guard} is empty. Unlike
+     * {@link #isInfeasible}, which tests the guard in isolation, this also rules out
+     * transitions that are individually satisfiable yet <em>unreachable</em>: e.g.
+     * the {@code x ≤ −1} half of a split {@code x != 0} guard under a source
+     * invariant {@code x ≥ 0} (an array index/length), or the {@code i ≥ n+1} half of
+     * a split {@code i != n} under {@code i ≤ n}. Dropping such a half is sound (it
+     * fires from no reachable state, since the invariant over-approximates the
+     * reachable states) and keeps the {@code !=}-split from leaving a spurious
+     * divergent transition that no ranking function can orient — which would
+     * otherwise sink the SCC into the expensive disjunctive fallback. The source
+     * invariant uses the location's formals (the {@code LIk} / {@code SIk} names),
+     * the same names the guard's input side carries, so they conjoin directly.
+     * Conservative: anything
+     * Apron cannot refute is kept (returns {@code false}).
+     */
+    public static boolean isInfeasibleUnder(ItsTransition t, List<ItsLinearConstraint> srcInvariant) {
+        if (srcInvariant == null || srcInvariant.isEmpty()) return isInfeasible(t);
+        try {
+            Manager man = new Polka(false);
+            LinkedHashSet<String> names = new LinkedHashSet<String>();
+            for (ItsLinearConstraint c : t.constraints()) names.addAll(c.lhs().variables());
+            for (ItsLinearConstraint c : srcInvariant) names.addAll(c.lhs().variables());
+            Environment env = new Environment(new String[0], names.toArray(new String[0]));
+            Abstract1 a = new Abstract1(man, env);   // ⊤
+            List<Lincons1> cons = new ArrayList<Lincons1>();
+            for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(env, c));
+            for (ItsLinearConstraint c : srcInvariant) cons.add(ApronBridge.toLincons(env, c));
+            if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
+            return a.isBottom(man);
+        } catch (ApronException e) {
+            return false;   // undecided ⇒ keep the transition (sound)
+        }
+    }
+
+    /**
      * True when the premises (each {@link ItsLinearExpression} {@code p} read as
      * {@code p ≥ 0}, exactly as {@link FarkasRanking} feeds its Farkas LP) entail
      * {@code Σ rhoTerms·v + rhoConst ≥ 0}, i.e. the polyhedron

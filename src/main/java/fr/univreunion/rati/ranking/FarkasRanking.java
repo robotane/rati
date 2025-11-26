@@ -165,6 +165,24 @@ public final class FarkasRanking {
             invariants = java.util.Collections.emptyMap();
         }
 
+        // Second pruning pass, now that per-location invariants are known: drop cyclic
+        // transitions unreachable UNDER the source invariant (guard ∧ invariant empty),
+        // not just self-contradictory ones (line above). This removes the spurious
+        // divergent half a `!=`-guard split leaves behind — e.g. the `i >= n+1` branch
+        // of `i != n` under the loop invariant `i <= n`, or `x <= -1` of `x != 0` under
+        // `x >= 0`. Such a half fires from no reachable state, so dropping it is sound;
+        // keeping it forces an unrankable transition into the SCC, collapsing the cheap
+        // lexicographic round and pushing the proof into the costly disjunctive fallback
+        // (measured: Diff.dif 53s → 231s before this prune).
+        if (!invariants.isEmpty()) {
+            final Map<String, List<ItsLinearConstraint>> inv = invariants;
+            for (List<ItsTransition> ts : cyclic.values())
+                ts.removeIf(t -> ItsInvariants.isInfeasibleUnder(t, inv.get(t.source().name())));
+            nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
+            if (nonTrivial.isEmpty())
+                return new Certificate(unsupportedReachable ? Verdict.UNKNOWN : Verdict.TERMINATES, outProofs);
+        }
+
         // Rank every SCC (pointless when an unsupported transition already bars a
         // TERMINATES); the unranked ones become non-termination candidates.
         List<List<ItsTransition>> unranked = new ArrayList<List<ItsTransition>>();
