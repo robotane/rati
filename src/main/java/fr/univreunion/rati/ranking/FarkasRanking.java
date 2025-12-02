@@ -92,7 +92,30 @@ public final class FarkasRanking {
         public String method = "?";
         /** One entry per peeling round: location name → rendered ranking function. */
         public final List<Map<String, String>> rounds = new ArrayList<Map<String, String>>();
+        /**
+         * The same peeling rounds in a machine-readable form for the CPF exporter:
+         * each round carries the integer-scaled affine ρ per location and the
+         * transitions it strictly orients (peels). Populated only on the direct
+         * lexicographic-linear (ADFG) path proved on the SCC's own transitions —
+         * the one shape that maps to a CeTA {@code transitionRemoval} chain. Empty
+         * for the loop-summary, multiphase and disjunctive techniques.
+         */
+        public final List<RankRound> cpfRounds = new ArrayList<RankRound>();
         SccProof(List<String> locations) { this.locations = locations; }
+    }
+
+    /**
+     * One ADFG peeling round, machine-readable. {@link #rho} maps a location to its
+     * integer-scaled affine ranking coefficients aligned to that location's formals
+     * (one extra trailing slot for the constant), uniformly scaled across the round
+     * so the lexicographic level is integer-valued; {@link #removed} are the
+     * transitions this round strictly decreases (and that a CeTA transitionRemoval
+     * deletes).
+     */
+    public static final class RankRound {
+        /** location → [coeff for formal 0, …, coeff for formal n−1, constant], integer-scaled. */
+        public final Map<String, long[]> rho = new LinkedHashMap<String, long[]>();
+        public final List<ItsTransition> removed = new ArrayList<ItsTransition>();
     }
 
     /** Proves termination or non-termination AND collects a {@link Certificate}. */
@@ -310,14 +333,19 @@ public final class FarkasRanking {
         // it fails — typically a multi-block diamond / nested loop where boundedness
         // holds only after merging the body — retry on the cut-point loop summary.
         List<Map<String, String>> rounds = proof == null ? null : new ArrayList<Map<String, String>>();
-        if (rankTransitions(its, invariants, cyclicTrans, rounds) == Verdict.TERMINATES)
+        // The CPF exporter consumes the direct path only (ranking on the SCC's own
+        // transitions), so the rounds it records reference real, emittable transitions.
+        List<RankRound> cpf = proof == null ? null : new ArrayList<RankRound>();
+        if (rankTransitions(its, invariants, cyclicTrans, rounds, cpf) == Verdict.TERMINATES) {
+            if (proof != null) proof.cpfRounds.addAll(cpf);
             return record(proofs, proof, "lexicographic linear (ADFG)", rounds);
+        }
         List<ItsTransition> summary = LoopSummary.summarize(cyclicTrans);
         List<ItsTransition> best = cyclicTrans;
         if (summary != cyclicTrans) {
             if (DEBUG) System.err.println("  retry on loop summary (" + summary.size() + " transitions)");
             List<Map<String, String>> sRounds = proof == null ? null : new ArrayList<Map<String, String>>();
-            if (rankTransitions(its, invariants, summary, sRounds) == Verdict.TERMINATES)
+            if (rankTransitions(its, invariants, summary, sRounds, null) == Verdict.TERMINATES)
                 return record(proofs, proof, "lexicographic linear (ADFG, loop summary)", sRounds);
             best = summary;
         }
@@ -376,7 +404,8 @@ public final class FarkasRanking {
      */
     private static Verdict rankTransitions(IntegerTransitionSystem its,
                                    Map<String, List<ItsLinearConstraint>> invariants,
-                                   List<ItsTransition> transitions, List<Map<String, String>> rounds) {
+                                   List<ItsTransition> transitions, List<Map<String, String>> rounds,
+                                   List<RankRound> cpf) {
         Set<String> locNames = new LinkedHashSet<String>();
         for (ItsTransition t : transitions) { locNames.add(t.source().name()); locNames.add(t.target().name()); }
         List<String> locs = new ArrayList<String>(locNames);
@@ -385,12 +414,14 @@ public final class FarkasRanking {
         List<ItsTransition> active = new ArrayList<ItsTransition>(transitions);
         while (!active.isEmpty()) {
             Map<String, String> roundFn = rounds == null ? null : new LinkedHashMap<String, String>();
-            List<ItsTransition> strict = orientRound(its, invariants, locs, active, roundFn);
+            RankRound cpfRound = cpf == null ? null : new RankRound();
+            List<ItsTransition> strict = orientRound(its, invariants, locs, active, roundFn, cpfRound);
             if (strict.isEmpty()) {
                 // Global-bound round stuck (e.g. a region-split loop where no single ρ
                 // is bounded below on every active transition): retry the relaxed round.
                 if (roundFn != null) roundFn.clear();
-                strict = orientRoundRelaxed(its, invariants, locs, active, roundFn);
+                if (cpfRound != null) cpfRound.rho.clear();
+                strict = orientRoundRelaxed(its, invariants, locs, active, roundFn, cpfRound);
             }
             if (DEBUG) {
                 StringBuilder sb = new StringBuilder();
@@ -399,6 +430,7 @@ public final class FarkasRanking {
             }
             if (strict.isEmpty()) return Verdict.UNKNOWN;     // no linear component peels
             if (rounds != null) rounds.add(roundFn);
+            if (cpfRound != null) { cpfRound.removed.addAll(strict); cpf.add(cpfRound); }
             active.removeAll(strict);
         }
         return Verdict.TERMINATES;
@@ -412,7 +444,8 @@ public final class FarkasRanking {
      */
     private static List<ItsTransition> orientRound(IntegerTransitionSystem its,
             Map<String, List<ItsLinearConstraint>> invariants,
-            List<String> locs, List<ItsTransition> active, Map<String, String> roundFn) {
+            List<String> locs, List<ItsTransition> active, Map<String, String> roundFn,
+            RankRound cpfRound) {
         Builder b = new Builder(its, invariants);
         b.allocLambdas(locs);
         for (ItsTransition t : active) b.allocEps(t);
@@ -426,6 +459,7 @@ public final class FarkasRanking {
         for (ItsTransition t : active)
             if (sol.x[b.eps.get(t)].isPositive()) strict.add(t);    // certified positive decrease
         if (roundFn != null) for (String loc : locs) roundFn.put(loc, b.renderRho(loc, sol.x, its));
+        if (cpfRound != null) cpfRound.rho.putAll(b.scaledRound(locs, sol.x));
         return strict;
     }
 
@@ -445,7 +479,8 @@ public final class FarkasRanking {
      */
     private static List<ItsTransition> orientRoundRelaxed(IntegerTransitionSystem its,
             Map<String, List<ItsLinearConstraint>> invariants,
-            List<String> locs, List<ItsTransition> active, Map<String, String> roundFn) {
+            List<String> locs, List<ItsTransition> active, Map<String, String> roundFn,
+            RankRound cpfRound) {
         List<ItsTransition> best = new ArrayList<ItsTransition>();
         Builder bestB = null;
         Rational[] bestX = null;
@@ -467,6 +502,7 @@ public final class FarkasRanking {
         }
         if (roundFn != null && bestB != null)
             for (String loc : locs) roundFn.put(loc, bestB.renderRho(loc, bestX, its));
+        if (cpfRound != null && bestB != null) cpfRound.rho.putAll(bestB.scaledRound(locs, bestX));
         return best;
     }
 
@@ -539,6 +575,39 @@ public final class FarkasRanking {
             Rational k = x[pos[arity]].subtract(x[neg[arity]]);
             if (!k.isZero() || sb.length() == 0) appendTerm(sb, k, null);
             return sb.length() == 0 ? "0" : sb.toString();
+        }
+
+        /**
+         * Integer-scaled affine ρ for every location in a round, scaled by ONE common
+         * denominator (the lcm over all locations' coefficients) so the whole
+         * lexicographic level is integer-valued — a uniform positive scale preserves
+         * both the ρ ≥ 0 bound and the strict decrease, and an integer ρ that strictly
+         * decreases does so by ≥ 1, which is what a CeTA transitionRemoval (bound 0)
+         * checks. Returns location → {@code [coeff for formal 0, …, formal n−1, constant]}.
+         */
+        Map<String, long[]> scaledRound(List<String> locs, Rational[] x) {
+            Map<String, Rational[]> raw = new LinkedHashMap<String, Rational[]>();
+            BigInteger den = BigInteger.ONE;
+            for (String loc : locs) {
+                int arity = its.location(loc).variables().size();
+                int[] pos = lamPos.get(loc), neg = lamNeg.get(loc);
+                Rational[] r = new Rational[arity + 1];
+                for (int i = 0; i <= arity; i++) {
+                    r[i] = x[pos[i]].subtract(x[neg[i]]);
+                    BigInteger d = r[i].denominator();
+                    den = den.divide(den.gcd(d)).multiply(d);     // lcm of all denominators
+                }
+                raw.put(loc, r);
+            }
+            Map<String, long[]> out = new LinkedHashMap<String, long[]>();
+            for (Map.Entry<String, Rational[]> e : raw.entrySet()) {
+                Rational[] r = e.getValue();
+                long[] c = new long[r.length];
+                for (int i = 0; i < r.length; i++)
+                    c[i] = r[i].numerator().multiply(den).divide(r[i].denominator()).longValueExact();
+                out.put(e.getKey(), c);
+            }
+            return out;
         }
 
         /**

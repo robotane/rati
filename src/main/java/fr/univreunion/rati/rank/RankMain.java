@@ -37,12 +37,13 @@ public final class RankMain {
     private RankMain() {}
 
     public static void main(String[] args) {
-        String file = null, entry = null;
+        String file = null, entry = null, cpfOut = null;
         boolean quiet = false;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             if (a.equals("--entry") && i + 1 < args.length) entry = args[++i];
             else if (a.equals("--quiet")) quiet = true;
+            else if (a.equals("--cpf") && i + 1 < args.length) cpfOut = args[++i];
             else if (a.startsWith("--")) { usage("unknown option: " + a); return; }
             else if (file == null) file = a;
             else { usage("unexpected argument: " + a); return; }
@@ -106,6 +107,7 @@ public final class RankMain {
         if (cert.verdict == FarkasRanking.Verdict.TERMINATES) {
             System.out.println("TERMINATES");
             if (!quiet) printCertificate(cert);
+            if (cpfOut != null) writeCpf(parsed.its, start, cert, cpfOut);
             System.exit(0);
         } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES) {
             System.out.println("NONTERMINATES");
@@ -166,9 +168,29 @@ public final class RankMain {
         }
     }
 
+    /**
+     * Writes a CPF LTS termination certificate for CeTA to {@code out}, or, when the
+     * proof shape is not exportable, leaves no file and warns — the caller treats a
+     * missing file as "terminating but not certified" (never as wrong).
+     */
+    private static void writeCpf(fr.univreunion.rati.its.IntegerTransitionSystem its,
+            String start, FarkasRanking.Certificate cert, String out) {
+        String xml = fr.univreunion.rati.cpf.CpfExporter.export(its, start, cert);
+        if (xml == null) {
+            System.err.println("[rati] no CPF certificate written: proof shape not exportable");
+            return;
+        }
+        try {
+            Files.write(Paths.get(out), xml.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            System.err.println("[rati] could not write CPF certificate to " + out + ": " + e.getMessage());
+        }
+    }
+
     private static void usage(String err) {
         if (err != null) System.err.println("error: " + err);
-        System.err.println("usage: rank <file.koat> [--entry <functor>] [--quiet]");
+        System.err.println("usage: rank <file.koat> [--entry <functor>] [--quiet] [--cpf <out.xml>]");
+        System.err.println("  --cpf writes a CPF LTS termination certificate for CeTA on a TERMINATES verdict");
         System.err.println("  reads a KoAT-format ITS, prints TERMINATES (+ ranking certificate),");
         System.err.println("  NONTERMINATES (+ recurrent-set witness) or UNKNOWN");
         System.err.println("  exit code: 0 TERMINATES, 1 UNKNOWN, 2 usage/IO error, 3 NONTERMINATES");
