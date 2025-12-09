@@ -42,14 +42,27 @@ final class MultiphaseRanking {
 
     private MultiphaseRanking() {}
 
+    /**
+     * Synthesises a MΦRF of depth ≤ {@link #MAX_DEPTH} for the SCC and surfaces its
+     * components ({@link FarkasRanking.MphiCert}), or returns {@code null} when none
+     * exists. Sound by construction (exact-rational LP); the returned functions are
+     * the witness the CPF exporter turns into a per-phase {@code transitionRemoval}
+     * chain.
+     */
+    static FarkasRanking.MphiCert rank(List<ItsTransition> transitions,
+                       Map<String, List<ItsLinearConstraint>> invariants) {
+        List<String> locs = locationsOf(transitions);
+        for (int d = 1; d <= MAX_DEPTH; d++) {
+            FarkasRanking.MphiCert r = new Builder(invariants, d, locs).extract(transitions);
+            if (r != null) return r;
+        }
+        return null;
+    }
+
     /** True iff the SCC's transitions admit a MΦRF of depth ≤ {@link #MAX_DEPTH}. */
     static boolean ranks(List<ItsTransition> transitions,
                          Map<String, List<ItsLinearConstraint>> invariants) {
-        List<String> locs = locationsOf(transitions);
-        for (int d = 1; d <= MAX_DEPTH; d++) {
-            if (new Builder(invariants, d, locs).feasible(transitions)) return true;
-        }
-        return false;
+        return rank(transitions, invariants) != null;
     }
 
     private static List<String> locationsOf(List<ItsTransition> ts) {
@@ -81,7 +94,8 @@ final class MultiphaseRanking {
             for (String loc : locs) arity.put(loc, -1);   // arity learned from transitions
         }
 
-        boolean feasible(List<ItsTransition> transitions) {
+        /** Builds the nested-RF feasibility LP (Def 3.1 conditions) over the SCC. */
+        private LinearProgram buildLp(List<ItsTransition> transitions) {
             // Learn each location's arity from the transitions it appears in.
             for (ItsTransition t : transitions) {
                 arity.put(t.source().name(), t.source().arity());
@@ -107,7 +121,54 @@ final class MultiphaseRanking {
             }
             LinearProgram lp = new LinearProgram(next);
             for (int r = 0; r < rows.size(); r++) lp.addConstraint(dense(rows.get(r)), ops.get(r), rhs.get(r));
-            return lp.solve().feasible;
+            return lp;
+        }
+
+        /**
+         * Solves the depth-{@code d} LP and, when feasible, reads the phase functions
+         * {@code f_1,…,f_d} off the λ solution — one integer-scaled coefficient vector
+         * per location and phase. Returns {@code null} when no MΦRF of this depth exists.
+         */
+        FarkasRanking.MphiCert extract(List<ItsTransition> transitions) {
+            LinearProgram.Solution sol = buildLp(transitions).solve();
+            if (!sol.feasible || sol.x == null) return null;
+            List<String> locs = new ArrayList<String>(arity.keySet());
+            java.util.Collections.sort(locs);
+            List<Map<String, long[]>> phases = new ArrayList<Map<String, long[]>>();
+            for (int i = 1; i <= d; i++) phases.add(scalePhase(i, locs, sol.x));
+            return new FarkasRanking.MphiCert(d, phases);
+        }
+
+        /**
+         * Integer-scaled {@code f_i} for every location, scaled by ONE common
+         * denominator (the lcm over the phase's coefficients) so each phase function
+         * is integer-valued — a uniform positive scale preserves both its sign region
+         * ({@code f_i≤0}/{@code f_i≥1}) and the strict decrease a CeTA transitionRemoval
+         * checks. Mirrors {@link FarkasRanking.Builder#scaledRound}.
+         */
+        private Map<String, long[]> scalePhase(int i, List<String> locs, Rational[] x) {
+            Map<String, Rational[]> raw = new java.util.LinkedHashMap<String, Rational[]>();
+            java.math.BigInteger den = java.math.BigInteger.ONE;
+            for (String loc : locs) {
+                int[] pos = lamPos.get(i + "|" + loc), neg = lamNeg.get(i + "|" + loc);
+                if (pos == null) continue;
+                Rational[] r = new Rational[pos.length];
+                for (int k = 0; k < pos.length; k++) {
+                    r[k] = x[pos[k]].subtract(x[neg[k]]);
+                    java.math.BigInteger dn = r[k].denominator();
+                    den = den.divide(den.gcd(dn)).multiply(dn);   // lcm of all denominators
+                }
+                raw.put(loc, r);
+            }
+            Map<String, long[]> out = new java.util.LinkedHashMap<String, long[]>();
+            for (Map.Entry<String, Rational[]> e : raw.entrySet()) {
+                Rational[] r = e.getValue();
+                long[] c = new long[r.length];
+                for (int k = 0; k < r.length; k++)
+                    c[k] = r[k].numerator().multiply(den).divide(r[k].denominator()).longValueExact();
+                out.put(e.getKey(), c);
+            }
+            return out;
         }
 
         private void allocLambda(int i, String loc, int ar) {

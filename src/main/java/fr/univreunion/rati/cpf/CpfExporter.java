@@ -83,8 +83,33 @@ public final class CpfExporter {
     private Set<String> reachable;
     private List<String> stateVars;
     private Map<String, String> outToState;            // LO0 -> LI0, SO1 -> SI1
-    private Map<ItsTransition, String> tid;            // stable transition ids
-    private List<ItsTransition> edges;                 // reachable transitions, in id order
+    private Map<ItsTransition, String> tid;            // non-split transition -> its single id
+    private List<Emit> edges;                          // emitted transitions, in id order
+    /** For each MΦRF SCC: phase i (1-based) -> the ids of that SCC's phase-i sub-transitions. */
+    private Map<SccProof, List<List<String>>> mphiPlan;
+
+    /**
+     * One emitted LTS transition: an ITS transition {@code t} optionally restricted
+     * by extra phase-region conjuncts {@code regions} (empty for an un-split edge).
+     * A MΦRF cyclic transition is emitted as {@code depth} such {@code Emit}s, one
+     * per phase region; every other reachable transition is emitted once with no
+     * region.
+     */
+    private static final class Emit {
+        final ItsTransition t;
+        final String id;
+        final List<Region> regions;
+        Emit(ItsTransition t, String id, List<Region> regions) {
+            this.t = t; this.id = id; this.regions = regions;
+        }
+    }
+
+    /** A phase-region conjunct over the source pre-state: {@code f ≥ 1} or {@code f ≤ 0}. */
+    private static final class Region {
+        final long[] f;          // coefficients [c_0,…,c_{n−1}, constant] over stateVars
+        final boolean geOne;     // true ⇒ f ≥ 1 ; false ⇒ f ≤ 0
+        Region(long[] f, boolean geOne) { this.f = f; this.geOne = geOne; }
+    }
 
     private String build(IntegerTransitionSystem its, String entry, Certificate cert) {
         reachable = reachableFrom(its, entry);
@@ -92,13 +117,7 @@ public final class CpfExporter {
         outToState = new LinkedHashMap<String, String>();
         for (String v : stateVars) outToState.put(outputName(v), v);
 
-        edges = new ArrayList<ItsTransition>();
-        tid = new IdentityHashMap<ItsTransition, String>();
-        for (ItsTransition t : its.transitions()) {
-            if (!reachable.contains(t.source().name())) continue;
-            tid.put(t, "t" + edges.size());
-            edges.add(t);
-        }
+        buildEdges(its, cert);
 
         Map<String, List<ItsLinearConstraint>> invariants =
                 ItsInvariants.compute(its, entry, reachable);
@@ -124,28 +143,93 @@ public final class CpfExporter {
         return sb.toString();
     }
 
+    /**
+     * Builds the emitted-transition list, splitting every cyclic transition of a
+     * MΦRF SCC into its {@code depth} phase regions (each carrying the original
+     * relation plus {@code f_1≤0 ∧ … ∧ f_{i−1}≤0 ∧ (i<d ? f_i≥1 : true)}) and
+     * leaving every other reachable transition un-split. Records, per MΦRF SCC, the
+     * sub-transition ids grouped by phase for the ordered {@code transitionRemoval}.
+     */
+    private void buildEdges(IntegerTransitionSystem its, Certificate cert) {
+        edges = new ArrayList<Emit>();
+        tid = new IdentityHashMap<ItsTransition, String>();
+        mphiPlan = new LinkedHashMap<SccProof, List<List<String>>>();
+
+        // location -> the MΦRF SCC it belongs to (if any).
+        Map<String, SccProof> mphiByLoc = new LinkedHashMap<String, SccProof>();
+        for (SccProof s : cert.sccs)
+            if (s.multiphase != null)
+                for (String loc : s.locations) mphiByLoc.put(loc, s);
+        for (SccProof s : cert.sccs)
+            if (s.multiphase != null) {
+                List<List<String>> phases = new ArrayList<List<String>>();
+                for (int i = 0; i < s.multiphase.depth; i++) phases.add(new ArrayList<String>());
+                mphiPlan.put(s, phases);
+            }
+
+        int n = 0;
+        for (ItsTransition t : its.transitions()) {
+            String src = t.source().name(), tgt = t.target().name();
+            if (!reachable.contains(src)) continue;
+            SccProof s = mphiByLoc.get(src);
+            boolean cyclicInMphi = s != null && s == mphiByLoc.get(tgt);
+            if (!cyclicInMphi) {
+                String id = "t" + (n++);
+                tid.put(t, id);
+                edges.add(new Emit(t, id, java.util.Collections.<Region>emptyList()));
+                continue;
+            }
+            // Split this cyclic transition by the MΦRF phase regions of its source.
+            int d = s.multiphase.depth;
+            List<List<String>> phases = mphiPlan.get(s);
+            for (int i = 1; i <= d; i++) {
+                List<Region> regions = new ArrayList<Region>();
+                for (int j = 1; j < i; j++)                       // f_j(src) ≤ 0
+                    regions.add(new Region(phaseCoeffs(s, j, src), false));
+                if (i < d)                                        // f_i(src) ≥ 1
+                    regions.add(new Region(phaseCoeffs(s, i, src), true));
+                String id = "t" + (n++) + "_p" + i;
+                edges.add(new Emit(t, id, regions));
+                phases.get(i - 1).add(id);
+            }
+        }
+    }
+
+    /** Phase-{@code i} (1-based) component {@code f_i} of a MΦRF SCC at a location. */
+    private static long[] phaseCoeffs(SccProof s, int i, String loc) {
+        long[] c = s.multiphase.phase.get(i - 1).get(loc);
+        if (c == null) throw new NotExportable("MΦRF phase " + i + " missing at " + loc);
+        return c;
+    }
+
     // -- input LTS -----------------------------------------------------------
 
     private void emitInput(StringBuilder sb, String entry) {
         sb.append("  <input>\n    <lts>\n");
         sb.append("      <initial><locationId>").append(esc(entry)).append("</locationId></initial>\n");
-        for (ItsTransition t : edges) {
+        for (Emit em : edges) {
+            ItsTransition t = em.t;
             sb.append("      <transition>\n");
-            sb.append("        <transitionId>").append(tid.get(t)).append("</transitionId>\n");
+            sb.append("        <transitionId>").append(em.id).append("</transitionId>\n");
             sb.append("        <source><locationId>").append(esc(t.source().name())).append("</locationId></source>\n");
             sb.append("        <target><locationId>").append(esc(t.target().name())).append("</locationId></target>\n");
             sb.append("        <formula>\n");
-            emitTransitionFormula(sb, t);
+            emitTransitionFormula(sb, em);
             sb.append("        </formula>\n");
             sb.append("      </transition>\n");
         }
         sb.append("    </lts>\n  </input>\n");
     }
 
-    /** The transition relation = its guard (LI→pre, LO→post) plus any non-identity update. */
-    private void emitTransitionFormula(StringBuilder sb, ItsTransition t) {
+    /**
+     * The transition relation = its guard (LI→pre, LO→post), any non-identity update,
+     * plus the phase-region conjuncts that restrict a MΦRF split sub-transition.
+     */
+    private void emitTransitionFormula(StringBuilder sb, Emit em) {
+        ItsTransition t = em.t;
         sb.append("          <conjunction>\n");
         for (ItsLinearConstraint c : t.constraints()) emitConstraint(sb, c);
+        for (Region r : em.regions) emitRegion(sb, r);
         // Updates: target formal i receives updates[i]. The common case updates[i] = LO_i
         // is the identity (post = the guard's output variable) and is already carried by
         // the guard; emit an explicit eq only for a non-trivial update expression.
@@ -160,6 +244,23 @@ public final class CpfExporter {
             sb.append("</eq>\n");
         }
         sb.append("          </conjunction>\n");
+    }
+
+    /** A phase-region conjunct over the source pre-state: {@code 1 ≤ f} or {@code f ≤ 0}. */
+    private void emitRegion(StringBuilder sb, Region r) {
+        sb.append("            <leq>");
+        if (r.geOne) { sb.append("<constant>1</constant>"); emitAffineSum(sb, r.f); }
+        else         { emitAffineSum(sb, r.f); sb.append("<constant>0</constant>"); }
+        sb.append("</leq>\n");
+    }
+
+    /** Emits {@code Σ c_i·formal_i + const} over the pre-state {@code stateVars} as a {@code <sum>}. */
+    private void emitAffineSum(StringBuilder sb, long[] coeffs) {
+        sb.append("<sum>");
+        for (int i = 0; i < stateVars.size() && i < coeffs.length - 1; i++)
+            if (coeffs[i] != 0) emitTerm(sb, coeffs[i], "<variableId>" + esc(stateVars.get(i)) + "</variableId>");
+        sb.append("<constant>").append(coeffs[coeffs.length - 1]).append("</constant>");
+        sb.append("</sum>");
     }
 
     /** True iff {@code e} is exactly the single output variable {@code outputName(formal)}. */
@@ -216,9 +317,10 @@ public final class CpfExporter {
             sb.append("      </switchToCooperationTermination>\n");
             return;
         }
-        // Every recorded SCC must come from the direct ADFG path (per-transition rounds).
+        // Every recorded SCC must be exportable: either the direct ADFG path
+        // (per-transition rounds) or a surfaced MΦRF (phase-split chain).
         for (SccProof scc : cert.sccs)
-            if (scc.cpfRounds.isEmpty())
+            if (scc.cpfRounds.isEmpty() && scc.multiphase == null)
                 throw new NotExportable("SCC proved by a non-exportable technique: " + scc.method);
 
         sb.append("      <newInvariants>\n");
@@ -270,10 +372,10 @@ public final class CpfExporter {
             sb.append("</invariant>\n");
             sb.append("              <location><locationId>").append(esc(loc)).append("</locationId></location>\n");
             sb.append("              <children>\n");
-            for (ItsTransition t : edges)
-                if (t.source().name().equals(loc))
-                    sb.append("                <child><transitionId>").append(tid.get(t))
-                      .append("</transitionId><nodeId>").append(esc(t.target().name())).append("</nodeId></child>\n");
+            for (Emit em : edges)
+                if (em.t.source().name().equals(loc))
+                    sb.append("                <child><transitionId>").append(em.id)
+                      .append("</transitionId><nodeId>").append(esc(em.t.target().name())).append("</nodeId></child>\n");
             sb.append("              </children>\n            </node>\n");
         }
         sb.append("          </nodes>\n        </impact>\n");
@@ -312,7 +414,8 @@ public final class CpfExporter {
         for (String loc : scc.locations)
             sb.append("<locationDuplicate>").append(esc(loc)).append("</locationDuplicate>");
         sb.append("</scc>\n");
-        emitTransitionRemovalChain(sb, scc, 0);
+        if (!scc.cpfRounds.isEmpty()) emitTransitionRemovalChain(sb, scc, 0);
+        else emitMphiChain(sb, scc, 1);
         sb.append("            </sccWithProof>\n");
     }
 
@@ -341,15 +444,39 @@ public final class CpfExporter {
         sb.append("              </transitionRemoval>\n");
     }
 
+    /**
+     * One {@code transitionRemoval} per MΦRF phase, removing phase {@code i}'s
+     * sub-transitions by ranking with {@code f_i} (bound 0) and recursing on the
+     * remaining phases; the innermost closes with an empty sccDecomposition. Each
+     * round is a valid linear entailment: in phase {@code i}'s region {@code f_i ≥ 1}
+     * (boundedness) and {@code f_i} strictly decreases, while on every later phase
+     * {@code f_1≤0 ∧ … ∧ f_{i−1}≤0} makes (13_i) force {@code Δf_i ≥ 1 ≥ 0}
+     * (non-increasing) — exactly what CeTA re-checks.
+     */
+    private void emitMphiChain(StringBuilder sb, SccProof scc, int phase) {
+        if (phase > scc.multiphase.depth) { sb.append("              <sccDecomposition/>\n"); return; }
+        List<String> ids = mphiPlan.get(scc).get(phase - 1);
+        Map<String, long[]> f = scc.multiphase.phase.get(phase - 1);
+        sb.append("              <transitionRemoval>\n                <rankingFunctions>\n");
+        for (String loc : scc.locations) {
+            sb.append("                  <rankingFunction><location><locationDuplicate>").append(esc(loc))
+              .append("</locationDuplicate></location><expression>");
+            emitRankExpr(sb, loc, f.get(loc));
+            sb.append("</expression></rankingFunction>\n");
+        }
+        sb.append("                </rankingFunctions>\n");
+        sb.append("                <bound><constant>0</constant></bound>\n");
+        sb.append("                <remove>");
+        for (String id : ids) sb.append("<transitionDuplicate>").append(id).append("</transitionDuplicate>");
+        sb.append("</remove>\n");
+        emitMphiChain(sb, scc, phase + 1);
+        sb.append("              </transitionRemoval>\n");
+    }
+
     /** Ranking expression {@code Σ c_i·formal_i + const} over a location's pre-state formals. */
     private void emitRankExpr(StringBuilder sb, String loc, long[] coeffs) {
         if (coeffs == null) { sb.append("<constant>0</constant>"); return; }
-        List<String> formals = stateVars;            // uniform across locations
-        sb.append("<sum>");
-        for (int i = 0; i < formals.size() && i < coeffs.length - 1; i++)
-            if (coeffs[i] != 0) emitTerm(sb, coeffs[i], "<variableId>" + esc(formals.get(i)) + "</variableId>");
-        sb.append("<constant>").append(coeffs[coeffs.length - 1]).append("</constant>");
-        sb.append("</sum>");
+        emitAffineSum(sb, coeffs);
     }
 
     // -- helpers -------------------------------------------------------------

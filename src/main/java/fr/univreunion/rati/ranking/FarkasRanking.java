@@ -101,7 +101,32 @@ public final class FarkasRanking {
          * for the loop-summary, multiphase and disjunctive techniques.
          */
         public final List<RankRound> cpfRounds = new ArrayList<RankRound>();
+        /**
+         * Non-null exactly when this SCC is proved by a multiphase (MΦRF) function:
+         * the surfaced phase components ⟨f_1,…,f_d⟩ the CPF exporter turns into a
+         * phase-split LTS plus an ordered per-phase {@code transitionRemoval} chain.
+         * Mutually exclusive with a non-empty {@link #cpfRounds}.
+         */
+        public MphiCert multiphase;
         SccProof(List<String> locations) { this.locations = locations; }
+    }
+
+    /**
+     * A surfaced multiphase-linear ranking function (MΦRF): its depth {@code d} and,
+     * per phase {@code i = 1..d}, the integer-scaled affine component {@code f_i} at
+     * each location — {@code phase.get(i−1).get(loc) = [coeff formal 0, …, formal
+     * n−1, constant]}, aligned to that location's formals like {@link RankRound#rho}.
+     * The CPF exporter splits each cyclic transition into the {@code d} phase regions
+     * {@code f_1≤0 ∧ … ∧ f_{i−1}≤0 ∧ (i<d ? f_i≥1 : true)} and removes phase {@code i}
+     * by ranking with {@code f_i} (bound 0) — each step a valid linear entailment CeTA
+     * re-checks.
+     */
+    public static final class MphiCert {
+        public final int depth;
+        public final List<Map<String, long[]>> phase;
+        public MphiCert(int depth, List<Map<String, long[]>> phase) {
+            this.depth = depth; this.phase = phase;
+        }
     }
 
     /**
@@ -349,11 +374,31 @@ public final class FarkasRanking {
                 return record(proofs, proof, "lexicographic linear (ADFG, loop summary)", sRounds);
             best = summary;
         }
-        // A multiphase (MΦRF) ranking function — handles phase loops (a quantity
-        // grows while another is positive, then shrinks) that no single lexicographic
-        // linear ranking covers. Ben-Amram-Genaim nested-RF synthesis.
-        if (MultiphaseRanking.ranks(best, invariants)) {
-            if (DEBUG) System.err.println("  ranked by a multiphase (MΦRF) function");
+        // A multiphase (MΦRF) ranking function — handles phase loops (a quantity grows
+        // while another is positive, then shrinks) that no single lexicographic linear
+        // ranking covers. Ben-Amram-Genaim nested-RF synthesis. Prefer a DIRECT proof on
+        // the SCC's own cyclic transitions (per-location constant offsets absorb a
+        // multi-block cycle's identity transitions): it references real, emittable
+        // transitions, so the CPF exporter can turn it into a phase-split certificate.
+        // Guarded by an LP-size budget — the direct nested-RF LP grows with
+        // transitions × arity × depth, and is unaffordable on large SCCs (e.g. an
+        // 11-variable, dozens-of-transition method body); those keep the cheap summary
+        // path below (sound, just uncertified). Skipped entirely when not collecting a
+        // certificate (proof == null), since only the exporter consumes it.
+        if (proof != null && mphiDirectAffordable(cyclicTrans)) {
+            MphiCert direct = MultiphaseRanking.rank(cyclicTrans, invariants);
+            if (direct != null) {
+                if (DEBUG) System.err.println("  ranked by a direct multiphase (MΦRF) function, depth " + direct.depth);
+                proof.multiphase = direct;
+                return record(proofs, proof, "multiphase (MΦRF)", null);
+            }
+        }
+        // Fallback MΦRF on the loop summary (or the small direct set when no summary):
+        // still proves termination, but on a summary the merged transitions are not
+        // emittable, so the certificate is left unattached (the exporter declines — sound).
+        MphiCert mphi = MultiphaseRanking.rank(best, invariants);
+        if (mphi != null) {
+            if (DEBUG) System.err.println("  ranked by a multiphase (MΦRF) function, depth " + mphi.depth);
             return record(proofs, proof, "multiphase (MΦRF)", null);
         }
         // Last resort: disjunctive termination (Podelski-Rybalchenko transition
@@ -371,6 +416,27 @@ public final class FarkasRanking {
         }
         return Verdict.UNKNOWN;
     }
+
+    /**
+     * Whether a DIRECT multiphase synthesis on this SCC is cheap enough to attempt for
+     * the CPF certificate. The exact-rational nested-RF LP has on the order of
+     * {@code transitions × maxArity × MAX_DEPTH} unknowns (plus Farkas multipliers per
+     * premise); the exact simplex is super-linear in that, so an unbounded attempt
+     * hangs on a large method body (dozens of transitions, 11 state variables). The
+     * exportable multiphase loops of interest are small (a 2-block phase loop), so a
+     * tight budget captures them while keeping large SCCs on the cheap summary path.
+     */
+    private static boolean mphiDirectAffordable(List<ItsTransition> cyclicTrans) {
+        int maxArity = 0;
+        for (ItsTransition t : cyclicTrans) {
+            maxArity = Math.max(maxArity, t.source().arity());
+            maxArity = Math.max(maxArity, t.target().arity());
+        }
+        return (long) cyclicTrans.size() * maxArity <= MPHI_DIRECT_BUDGET;
+    }
+
+    /** Budget for {@link #mphiDirectAffordable} ({@code transitions × maxArity}). */
+    private static final int MPHI_DIRECT_BUDGET = 24;
 
     /** Commits a completed SCC proof to the certificate (when collecting) and returns TERMINATES. */
     private static Verdict record(List<SccProof> proofs, SccProof proof,
