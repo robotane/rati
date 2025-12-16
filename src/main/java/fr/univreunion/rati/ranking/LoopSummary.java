@@ -11,7 +11,6 @@ import apron.ApronException;
 import apron.Environment;
 import apron.Lincons1;
 import apron.Manager;
-import apron.Polka;
 
 import fr.univreunion.rati.its.ItsLinearConstraint;
 import fr.univreunion.rati.its.ItsLinearExpression;
@@ -43,7 +42,7 @@ public final class LoopSummary {
     /** Bail-out: composition can blow up multiplicatively; above this, give up (sound: caller ranks the raw SCC). */
     private static final int MAX_EDGES = 600;
 
-    private final Manager man = new Polka(false);
+    private final Manager man = ApronManagers.POLKA;
 
     private LoopSummary() {}
 

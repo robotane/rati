@@ -17,7 +17,6 @@ import apron.Environment;
 import apron.Lincons1;
 import apron.Linexpr1;
 import apron.Manager;
-import apron.Polka;
 
 import fr.univreunion.rati.its.IntegerTransitionSystem;
 import fr.univreunion.rati.its.ItsLinearConstraint;
@@ -47,7 +46,7 @@ public final class ItsInvariants {
     /** Joins before widening kicks in on a location (keeps a little precision first). */
     private static final int WIDEN_DELAY = 2;
 
-    private final Manager man = new Polka(false);
+    private final Manager man = ApronManagers.POLKA;
 
     private ItsInvariants() {}
 
@@ -67,7 +66,7 @@ public final class ItsInvariants {
      */
     public static boolean isInfeasible(ItsTransition t) {
         try {
-            Manager man = new Polka(false);
+            Manager man = ApronManagers.POLKA;
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             for (ItsLinearConstraint c : t.constraints()) names.addAll(c.lhs().variables());
             Environment env = new Environment(new String[0], names.toArray(new String[0]));
@@ -101,7 +100,7 @@ public final class ItsInvariants {
     public static boolean isInfeasibleUnder(ItsTransition t, List<ItsLinearConstraint> srcInvariant) {
         if (srcInvariant == null || srcInvariant.isEmpty()) return isInfeasible(t);
         try {
-            Manager man = new Polka(false);
+            Manager man = ApronManagers.POLKA;
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             for (ItsLinearConstraint c : t.constraints()) names.addAll(c.lhs().variables());
             for (ItsLinearConstraint c : srcInvariant) names.addAll(c.lhs().variables());
@@ -130,7 +129,7 @@ public final class ItsInvariants {
     public static boolean entailsNonNegative(List<ItsLinearExpression> premises,
                                              Map<String, Long> rhoTerms, long rhoConst) {
         try {
-            Manager man = new Polka(false);
+            Manager man = ApronManagers.POLKA;
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             if (premises != null) for (ItsLinearExpression p : premises) names.addAll(p.variables());
             names.addAll(rhoTerms.keySet());

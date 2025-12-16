@@ -12,7 +12,6 @@ import apron.Lincons1;
 import apron.Linexpr1;
 import apron.Linterm1;
 import apron.Manager;
-import apron.Polka;
 
 import fr.univreunion.rati.its.ItsLinearConstraint;
 import fr.univreunion.rati.its.ItsLinearExpression;
@@ -53,7 +52,7 @@ final class DisjunctiveTermination {
     private static final int MAX_RELATIONS = 12;
 
     /** Strict polyhedra (Polka true) so the union-complement {@code f < 0} is exact. */
-    private final Manager man = new Polka(true);
+    private final Manager man = ApronManagers.POLKA_STRICT;
     private final int n;                       // state dimension (cut-point arity)
 
     private DisjunctiveTermination(int n) { this.n = n; }
