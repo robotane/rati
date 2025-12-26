@@ -158,6 +158,11 @@ public final class FarkasRanking {
         if (entryLocation == null || its.location(entryLocation) == null)
             return new Certificate(Verdict.UNKNOWN, outProofs);
 
+        // Open a fresh exact-arithmetic work budget for this whole attempt: the LPs
+        // below abort cumulatively once a pathological SCC's Farkas synthesis blows up,
+        // turning a minutes-long grind into a bounded, deterministic UNKNOWN.
+        LinearProgram.beginProveWindow();
+
         Set<String> reachable = reachableFrom(its, entryLocation);
 
         // A reachable transition the model could not express faithfully rules a

@@ -86,8 +86,62 @@ public final class LinearProgram {
     private static final boolean USE_BAREISS =
             "bareiss".equalsIgnoreCase(System.getProperty("rati.exactArith", "rational"));
 
+    /**
+     * Cumulative budget, <em>per ranking attempt</em>, on exact-arithmetic <em>work</em> —
+     * the running sum of {@code tableauRows × tableauCols} charged once per simplex pivot,
+     * accumulated across every LP a single {@link FarkasRanking#prove} solves (it opens a
+     * fresh window via {@link #beginProveWindow()}). When the window's work passes the
+     * budget, the running solve aborts to {@link #infeasible()} and every later solve in
+     * the same attempt aborts at once — so the whole attempt is bounded, not each LP.
+     *
+     * <p>Why work, not a pivot count, a per-LP cap, or a wall clock:
+     * <ul>
+     *   <li><b>vs pivot count</b> — the synthesiser's multi-predicate Farkas LPs blow up in
+     *       tableau <em>area</em> (a many-location SCC with rich invariants reaches ~850
+     *       rows × ~1600 free-split columns), so one solve grinds minutes of exact-rational
+     *       pivoting yet at a pivot count (a few thousand) indistinguishable from a small
+     *       loop that proves in milliseconds. Work = pivots × area separates them.</li>
+     *   <li><b>vs a per-LP cap</b> — the relaxed ADFG round solves one LP per anchor
+     *       transition (~a dozen on these SCCs); a per-LP cap is paid once per anchor and
+     *       multiplies, so the attempt still runs minutes. The budget must span the attempt.</li>
+     *   <li><b>vs a wall/CPU clock</b> — work is a deterministic function of the LP, so the
+     *       abort point — hence every verdict — is byte-identical run to run and machine to
+     *       machine; a time cap makes verdicts depend on load.</li>
+     * </ul>
+     * Measured over the Julia09 corpus: the hardest genuinely-provable method totals
+     * ~8.2·10⁸ work, every other completing method ≤ ~6.6·10⁸, while the two pathological
+     * Diff loops each exceed 3·10⁹ in a single non-terminating solve — so the {@code 1.5·10⁹}
+     * default preserves every verdict (validated: byte-identical sweep) yet bounds the Diff
+     * grind. Aborting only ever yields {@link #infeasible()}, which every caller reads as
+     * "no proof via this step" — sound (never a false TERMINATES; the non-termination prover
+     * re-checks each witness by exact substitution). {@code -Drati.workBudget=N} overrides
+     * it; {@code 0} disables the cap.
+     */
+    public static final long WORK_BUDGET = Long.getLong("rati.workBudget", 1_500_000_000L);
+    private static long workSpent;   // per-attempt cumulative; single-threaded (ActiveProcessorCount=1)
+
+    /** Thrown when an attempt exceeds {@link #WORK_BUDGET}; caught in {@link #solve()}. */
+    private static final class BudgetExceeded extends RuntimeException {
+        BudgetExceeded() { super(null, null, false, false); }   // stackless
+    }
+
+    /** Opens a fresh work-budget window for one ranking attempt (a {@link FarkasRanking#prove}). */
+    public static void beginProveWindow() { workSpent = 0; }
+
     public Solution solve() {
-        return USE_BAREISS ? solveFractionFree() : solveRational();
+        if (WORK_BUDGET <= 0) return USE_BAREISS ? solveFractionFree() : solveRational();
+        try {
+            return USE_BAREISS ? solveFractionFree() : solveRational();
+        } catch (BudgetExceeded e) {
+            return infeasible();
+        }
+    }
+
+    /** Charges one pivot's worth of work and aborts the attempt if the budget is spent. */
+    private static void chargePivot(int m, int cols) {
+        if (WORK_BUDGET <= 0) return;
+        workSpent += (long) m * cols;
+        if (workSpent > WORK_BUDGET) throw new BudgetExceeded();
     }
 
     public Solution solveRational() {
@@ -263,6 +317,7 @@ public final class LinearProgram {
                 }
             }
             if (pr < 0) return false;                         // unbounded
+            chargePivot(m, cols);
             pivot(T, basis, z, m, cols, pr, pc);
 
             // Anti-cycling: a long run of degenerate pivots (zero min-ratio ⇒ no
@@ -462,6 +517,7 @@ public final class LinearProgram {
                 if (cmp < 0 || (cmp == 0 && basis[i] < basis[pr])) { pr = i; bn = n; bd = d; }
             }
             if (pr < 0) return false;                        // unbounded
+            chargePivot(m, cols);
             ffPivot(M, basis, z, m, cols, pr, pc, D);
         }
     }
