@@ -82,9 +82,27 @@ public final class RankMain {
             return;
         }
 
+        // Optional §8 dimensionality cap: existentially eliminate the operand-stack
+        // variables, keeping only local-to-local relations. Sound over-approximation
+        // (see StackProjection); cuts the bignum blow-up that makes a few systems
+        // (Ackermann, Numerical3) grind for tens of seconds in the rational LP.
+        fr.univreunion.rati.its.IntegerTransitionSystem its = parsed.its;
+        if (Boolean.getBoolean("rati.projectStack")) {
+            its = fr.univreunion.rati.its.StackProjection.project(its);
+            if (its.location(start) == null) its = parsed.its;   // defensive: keep entry
+            String dump = System.getProperty("rati.dumpProjected");
+            if (dump != null) {
+                try {
+                    Files.write(Paths.get(dump),
+                        fr.univreunion.rati.its.KoatPrinter.print(its, start)
+                            .getBytes(StandardCharsets.UTF_8));
+                } catch (IOException e) { System.err.println("[rati] dump failed: " + e); }
+            }
+        }
+
         FarkasRanking.Certificate cert;
         try {
-            cert = FarkasRanking.proveWithCertificate(parsed.its, start);
+            cert = FarkasRanking.proveWithCertificate(its, start);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
             // Apron's native library could not be loaded — a configuration error, not
             // an analysis outcome. RuntimeException's catch would miss it (it is an
@@ -107,9 +125,13 @@ public final class RankMain {
         if (cert.verdict == FarkasRanking.Verdict.TERMINATES) {
             System.out.println("TERMINATES");
             if (!quiet) printCertificate(cert);
-            if (cpfOut != null) writeCpf(parsed.its, start, cert, cpfOut);
+            if (cpfOut != null) writeCpf(its, start, cert, cpfOut);
             System.exit(0);
-        } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES) {
+        } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES
+                && !Boolean.getBoolean("rati.projectStack")) {
+            // A NONTERMINATES verdict is only sound on the exact (or under-approximated)
+            // system. Stack projection is an OVER-approximation, so a recurrent set it
+            // exposes can be spurious — downgrade to UNKNOWN when projecting.
             System.out.println("NONTERMINATES");
             if (!quiet) printNonTermination(cert.nonTermination);
             System.exit(3);
