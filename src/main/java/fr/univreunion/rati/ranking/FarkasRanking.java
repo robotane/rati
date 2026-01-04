@@ -60,6 +60,25 @@ public final class FarkasRanking {
 
     private static final boolean DEBUG = Boolean.getBoolean("rati.rankingDebug");
 
+    /**
+     * Reachable-location cap above which the Apron invariant pre-pass
+     * ({@link ItsInvariants#compute}) is skipped. That pass is a per-location
+     * join/widening worklist of ≈{@code 200·|reachable|} native polyhedral
+     * post-image steps; on a many-hundred-location method body (a method whose
+     * inlined call context spans the whole program — e.g. a Kitten type-checker
+     * visitor reaching ~900 locations) it grinds for tens of seconds, and unlike
+     * the LP it is <em>not</em> bounded by {@link LinearProgram#WORK_BUDGET}.
+     *
+     * <p>Skipping is sound: invariants only ever ADD premises to the Farkas LPs
+     * (boundedness facts and {@code !=}-split pruning), so omitting them can only
+     * forgo a proof — never fabricate a false TERMINATES. On these large bodies
+     * the ranking still runs on the raw guards; the verdict is the same UNKNOWN
+     * the grind would have reached, only fast. {@code -Drati.invariantMaxLocations=N}
+     * overrides it; {@code 0} disables the gate (always compute invariants).
+     */
+    private static final int INVARIANT_MAX_LOCS =
+            Integer.getInteger("rati.invariantMaxLocations", 300);
+
     private FarkasRanking() {}
 
     /**
@@ -211,11 +230,19 @@ public final class FarkasRanking {
         // Invariants only ever ADD premises / seed candidates, so a failure to
         // compute them must degrade the proof search, not crash it.
         Map<String, List<ItsLinearConstraint>> invariants;
-        try {
-            invariants = ItsInvariants.compute(its, entryLocation, reachable);
-        } catch (RuntimeException e) {
-            if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
+        if (INVARIANT_MAX_LOCS > 0 && reachable.size() > INVARIANT_MAX_LOCS) {
+            // Oversized reachable graph: the Apron fixpoint would grind (unbounded by
+            // the LP work budget). Skip it — sound, invariants only add premises.
+            if (DEBUG) System.err.println("[ranking] invariants skipped: reachable="
+                    + reachable.size() + " > " + INVARIANT_MAX_LOCS);
             invariants = java.util.Collections.emptyMap();
+        } else {
+            try {
+                invariants = ItsInvariants.compute(its, entryLocation, reachable);
+            } catch (RuntimeException e) {
+                if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
+                invariants = java.util.Collections.emptyMap();
+            }
         }
 
         // Second pruning pass, now that per-location invariants are known: drop cyclic
@@ -237,19 +264,40 @@ public final class FarkasRanking {
         }
 
         // Rank every SCC (pointless when an unsupported transition already bars a
-        // TERMINATES); the unranked ones become non-termination candidates.
-        List<List<ItsTransition>> unranked = new ArrayList<List<ItsTransition>>();
-        for (Integer comp : nonTrivial) {
-            if (unsupportedReachable
-                    || rankScc(its, invariants, cyclic.get(comp), proofs) != Verdict.TERMINATES)
-                unranked.add(cyclic.get(comp));
-        }
-        if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
+        // TERMINATES); the unranked ones become non-termination candidates. The whole
+        // ranking + non-termination search runs under the per-attempt LP-construction
+        // budget: a pathological SCC whose Farkas LPs blow up in construction (before any
+        // pivot) throws BuildBudgetExceeded, which we turn into a bounded, deterministic
+        // UNKNOWN — sound, since abandoning the search only ever forgoes a proof.
+        try {
+            List<List<ItsTransition>> unranked = new ArrayList<List<ItsTransition>>();
+            for (Integer comp : nonTrivial) {
+                if (unsupportedReachable
+                        || rankScc(its, invariants, cyclic.get(comp), proofs) != Verdict.TERMINATES)
+                    unranked.add(cyclic.get(comp));
+            }
+            if (DEBUG) System.err.println("[ranking] buildWork=" + LinearProgram.buildSpent());
+            if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
 
-        for (List<ItsTransition> sccTrans : unranked) {
-            NonTermination.Witness w =
-                    NonTermination.disprove(its, entryLocation, sccTrans, invariants);
-            if (w != null) return new Certificate(Verdict.NONTERMINATES, outProofs, w);
+            // When ranking fails we try to DISPROVE termination (recurrent-set search) before
+            // returning UNKNOWN. A caller that only consumes TERMINATES (BCTerm's whole-jar
+            // termination pass maps NONTERMINATES of the path-length ITS straight back to
+            // UNKNOWN — the abstraction over-approximates, so ITS non-termination does not
+            // imply program non-termination) is paying for a witness it discards, and this
+            // search runs precisely on the hardest SCCs. Let such a caller skip it with
+            // -Drati.skipNonTermination=true; the cross-check, which needs the witness, omits
+            // the flag. Sound: skipping only forgoes a NONTERMINATES, never a TERMINATES.
+            if (!Boolean.getBoolean("rati.skipNonTermination")) {
+                for (List<ItsTransition> sccTrans : unranked) {
+                    NonTermination.Witness w =
+                            NonTermination.disprove(its, entryLocation, sccTrans, invariants);
+                    if (w != null) return new Certificate(Verdict.NONTERMINATES, outProofs, w);
+                }
+            }
+        } catch (LinearProgram.BuildBudgetExceeded e) {
+            if (DEBUG) System.err.println("[ranking] LP build budget exhausted at "
+                    + LinearProgram.buildSpent() + "; UNKNOWN");
+            return new Certificate(Verdict.UNKNOWN, outProofs);
         }
         return new Certificate(Verdict.UNKNOWN, outProofs);
     }

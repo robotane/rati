@@ -120,13 +120,67 @@ public final class LinearProgram {
     public static final long WORK_BUDGET = Long.getLong("rati.workBudget", 1_500_000_000L);
     private static long workSpent;   // per-attempt cumulative; single-threaded (ActiveProcessorCount=1)
 
+    /**
+     * Cumulative budget, <em>per ranking attempt</em>, on LP <em>setup</em> work — the
+     * running sum of {@code tableauRows × tableauCols} charged once per {@link #solve()},
+     * accumulated across every LP a single {@link FarkasRanking#prove} solves. This is the
+     * cost {@link #WORK_BUDGET} does <em>not</em> see: each solve allocates the simplex
+     * tableau and prices the initial objective row ({@link #buildObjectiveRow}) — O(rows ×
+     * cols) of exact-rational work that runs <em>before the first pivot is charged</em>.
+     * The relaxed ADFG round ({@link FarkasRanking#orientRoundRelaxed}) solves one LP per
+     * <em>anchor</em> transition (a dozen-plus on a large SCC), and an anchor whose LP peels
+     * nothing still pays full setup; on a many-hundred-location Kitten visitor body that
+     * per-anchor setup grinds tens of seconds while almost no pivot is ever charged
+     * (confirmed by a thread dump parked in {@link #buildObjectiveRow}).
+     *
+     * <p>Kept <em>separate</em> from {@link #workSpent} on purpose: a pivot-bound but
+     * genuinely-provable method must not have its proof forgone because setup ate the pivot
+     * budget. Exhaustion throws {@link BuildBudgetExceeded}, caught in {@link
+     * FarkasRanking#prove} and turned into a deterministic UNKNOWN — sound, since (as with
+     * the pivot budget) abandoning the search only ever forgoes a proof, never fabricates a
+     * false TERMINATES. {@code -Drati.buildBudget=N} overrides it; {@code 0} disables it.
+     *
+     * <p>Calibrated on the Julia09 corpus + dumped Kitten bodies (setup work measured per
+     * attempt): the heaviest genuinely-provable method (KnapsackDP.SolveDP) totals
+     * ≈2.1·10⁶, every other proof less, while a Kitten visitor grinder passes 1·10⁸ of pure
+     * per-anchor setup. The {@code 10⁷} default clears every measured proof (≈5× margin)
+     * yet bounds the grinder to a sub-second UNKNOWN.
+     */
+    public static final long BUILD_BUDGET = Long.getLong("rati.buildBudget", 10_000_000L);
+    private static long buildSpent;   // per-attempt cumulative LP-setup work
+
     /** Thrown when an attempt exceeds {@link #WORK_BUDGET}; caught in {@link #solve()}. */
     private static final class BudgetExceeded extends RuntimeException {
         BudgetExceeded() { super(null, null, false, false); }   // stackless
     }
 
+    /**
+     * Thrown when an attempt's LP construction exceeds {@link #BUILD_BUDGET}. Unlike
+     * {@link BudgetExceeded} (charged inside the solver and swallowed by {@link #solve()}),
+     * this fires while {@link FarkasRanking}'s builder assembles rows, so it propagates out
+     * of the build and is caught at the {@link FarkasRanking#prove} ranking loop.
+     */
+    static final class BuildBudgetExceeded extends RuntimeException {
+        BuildBudgetExceeded() { super(null, null, false, false); }   // stackless
+    }
+
     /** Opens a fresh work-budget window for one ranking attempt (a {@link FarkasRanking#prove}). */
-    public static void beginProveWindow() { workSpent = 0; }
+    public static void beginProveWindow() { workSpent = 0; buildSpent = 0; }
+
+    /**
+     * Charges {@code work} units of LP-setup effort (a solve's tableau area) and aborts the
+     * attempt — via {@link BuildBudgetExceeded}, caught in {@link FarkasRanking#prove} —
+     * once {@link #BUILD_BUDGET} is spent. Called once per {@link #solve()} so a relaxed
+     * round that solves one zero-pivot LP per anchor on a huge SCC is bounded.
+     */
+    static void chargeBuild(long work) {
+        if (BUILD_BUDGET <= 0) return;
+        buildSpent += work;
+        if (buildSpent > BUILD_BUDGET) throw new BuildBudgetExceeded();
+    }
+
+    /** Construction work charged so far in the current attempt (diagnostics). */
+    static long buildSpent() { return buildSpent; }
 
     public Solution solve() {
         if (WORK_BUDGET <= 0) return USE_BAREISS ? solveFractionFree() : solveRational();
@@ -174,6 +228,11 @@ public final class LinearProgram {
         int slackBase = numVars;
         int artBase = numVars + nSlack;
         int cols = numVars + nSlack + nArt;
+
+        // Setup cost: tableau allocation + initial objective-row pricing are O(m × cols)
+        // and run before any pivot is charged. Charge them so a relaxed round that solves
+        // one (near-)zero-pivot LP per anchor on a huge SCC is bounded (see BUILD_BUDGET).
+        chargeBuild((long) m * cols);
 
         Rational[][] T = new Rational[m][cols + 1];
         int[] basis = new int[m];
@@ -415,6 +474,10 @@ public final class LinearProgram {
         int slackBase = numVars;
         int artBase = numVars + nSlack;
         int cols = numVars + nSlack + nArt;
+
+        // Setup cost (see solveRational): O(m × cols) tableau + objective-row work before
+        // the first charged pivot. Bounds the per-anchor relaxed round on huge SCCs.
+        chargeBuild((long) m * cols);
 
         BigInteger[][] M = new BigInteger[m][cols + 1];
         int[] basis = new int[m];

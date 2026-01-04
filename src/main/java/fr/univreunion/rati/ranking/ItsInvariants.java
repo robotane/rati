@@ -46,7 +46,35 @@ public final class ItsInvariants {
     /** Joins before widening kicks in on a location (keeps a little precision first). */
     private static final int WIDEN_DELAY = 2;
 
+    private static final boolean DEBUG = Boolean.getBoolean("rati.rankingDebug");
+
+    /**
+     * Deterministic budget on Apron post-image WORK in one invariant computation —
+     * the running sum of each {@link #postImage}'s environment dimension. The
+     * worklist's step budget ({@code 200·|reachable|}) bounds the number of iterations
+     * but not their cost: on a dense, deeply mutually-recursive reachable graph (e.g. a
+     * Kitten visitor where {@code checkForDeadcode} of every statement kind sits in one
+     * SCC) each post-image is a high-dimensional polyhedral transfer (change-environment
+     * + meet + project), super-linear in the dimension, so the fixpoint grinds tens of
+     * seconds while the step count stays modest. Charging by dimension bounds that grind
+     * deterministically (run-to-run identical, unlike a wall clock).
+     *
+     * <p>On exhaustion the whole computation is abandoned (a {@link RuntimeException} the
+     * caller — {@link FarkasRanking#prove} — turns into an empty invariant map): a
+     * half-finished worklist holds under-approximations (locations not yet reached along
+     * every path), which would be UNSOUND as Farkas premises, so all invariants are
+     * dropped. Sound, since absent invariants only ever forgo a proof, never fabricate
+     * one. {@code -Drati.invariantOpBudget=N} overrides it; {@code 0} disables it.
+     *
+     * <p>Calibrated on the Julia09 corpus: the heaviest invariant-dependent proof
+     * (KnapsackDP.SolveDP) charges ≈4.2·10³, every other proof less, while a dense Kitten
+     * visitor SCC passes 1.2·10⁵. The {@code 5·10⁴} default clears every measured proof
+     * (≈12× margin) yet bounds the grinder's fixpoint.
+     */
+    private static final long INV_OP_BUDGET = Long.getLong("rati.invariantOpBudget", 50_000L);
+
     private final Manager man = ApronManagers.POLKA;
+    private long invOpSpent;   // per-compute cumulative post-image work; single-threaded
 
     private ItsInvariants() {}
 
@@ -211,6 +239,7 @@ public final class ItsInvariants {
         } catch (ApronException e) {
             throw new RuntimeException(e);
         }
+        if (DEBUG) System.err.println("[invariants] opWork=" + invOpSpent);
         return out;
     }
 
@@ -257,6 +286,12 @@ public final class ItsInvariants {
         for (ItsLinearExpression e : t.updates()) names.addAll(e.variables());
         String[] res = new String[tv.size()];
         for (int j = 0; j < res.length; j++) { res[j] = "__res" + j; names.add(res[j]); }
+
+        // Charge this post-image by its polyhedral dimension (the cost driver) and abort
+        // the whole fixpoint — sound, via an empty invariant map — once the budget is spent.
+        invOpSpent += names.size();
+        if (INV_OP_BUDGET > 0 && invOpSpent > INV_OP_BUDGET)
+            throw new RuntimeException("invariant op budget exhausted at " + invOpSpent);
 
         Environment full = new Environment(new String[0], names.toArray(new String[0]));
         Abstract1 a = src.changeEnvironmentCopy(man, full, false);
