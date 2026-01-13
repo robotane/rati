@@ -59,6 +59,14 @@ public final class FarkasRanking {
     public enum Verdict { TERMINATES, NONTERMINATES, UNKNOWN }
 
     private static final boolean DEBUG = Boolean.getBoolean("rati.rankingDebug");
+    // Per-tier wall-clock instrumentation (forensics only, default OFF). Prints one
+    // line per ranking tier with the SCC size and elapsed ms, so a grinder's cost can
+    // be attributed to a specific tier (lexicographic / loop-summary / MΦRF / disjunctive).
+    private static final boolean TIER_TIMING = Boolean.getBoolean("rati.tierTiming");
+    private static void tier(String name, int sccSize, long t0) {
+        if (TIER_TIMING) System.err.printf("[tier] %-26s scc=%-3d %6.0f ms%n",
+                name, sccSize, (System.nanoTime() - t0) / 1e6);
+    }
 
     /**
      * Reachable-location cap above which the Apron invariant pre-pass
@@ -414,7 +422,11 @@ public final class FarkasRanking {
         // The CPF exporter consumes the direct path only (ranking on the SCC's own
         // transitions), so the rounds it records reference real, emittable transitions.
         List<RankRound> cpf = proof == null ? null : new ArrayList<RankRound>();
-        if (rankTransitions(its, invariants, cyclicTrans, rounds, cpf) == Verdict.TERMINATES) {
+        int sccSize = cyclicTrans.size();
+        long __t = System.nanoTime();
+        Verdict lex = rankTransitions(its, invariants, cyclicTrans, rounds, cpf);
+        tier("lexicographic", sccSize, __t);
+        if (lex == Verdict.TERMINATES) {
             if (proof != null) proof.cpfRounds.addAll(cpf);
             return record(proofs, proof, "lexicographic linear (ADFG)", rounds);
         }
@@ -423,7 +435,10 @@ public final class FarkasRanking {
         if (summary != cyclicTrans) {
             if (DEBUG) System.err.println("  retry on loop summary (" + summary.size() + " transitions)");
             List<Map<String, String>> sRounds = proof == null ? null : new ArrayList<Map<String, String>>();
-            if (rankTransitions(its, invariants, summary, sRounds, null) == Verdict.TERMINATES)
+            __t = System.nanoTime();
+            Verdict lexS = rankTransitions(its, invariants, summary, sRounds, null);
+            tier("lexicographic-summary", summary.size(), __t);
+            if (lexS == Verdict.TERMINATES)
                 return record(proofs, proof, "lexicographic linear (ADFG, loop summary)", sRounds);
             best = summary;
         }
@@ -439,7 +454,9 @@ public final class FarkasRanking {
         // path below (sound, just uncertified). Skipped entirely when not collecting a
         // certificate (proof == null), since only the exporter consumes it.
         if (proof != null && mphiDirectAffordable(cyclicTrans)) {
+            __t = System.nanoTime();
             MphiCert direct = MultiphaseRanking.rank(cyclicTrans, invariants);
+            tier("mphi-direct", cyclicTrans.size(), __t);
             if (direct != null) {
                 if (DEBUG) System.err.println("  ranked by a direct multiphase (MΦRF) function, depth " + direct.depth);
                 proof.multiphase = direct;
@@ -449,7 +466,9 @@ public final class FarkasRanking {
         // Fallback MΦRF on the loop summary (or the small direct set when no summary):
         // still proves termination, but on a summary the merged transitions are not
         // emittable, so the certificate is left unattached (the exporter declines — sound).
+        __t = System.nanoTime();
         MphiCert mphi = MultiphaseRanking.rank(best, invariants);
+        tier("mphi-best", best.size(), __t);
         if (mphi != null) {
             if (DEBUG) System.err.println("  ranked by a multiphase (MΦRF) function, depth " + mphi.depth);
             return record(proofs, proof, "multiphase (MΦRF)", null);
@@ -463,7 +482,10 @@ public final class FarkasRanking {
             for (ItsTransition t : best) ls.add(t.source().name() + "->" + t.target().name());
             System.err.println("  disjunctive input: " + best.size() + " transitions, edges=" + ls);
         }
-        if (DisjunctiveTermination.terminates(best)) {
+        __t = System.nanoTime();
+        boolean disj = DisjunctiveTermination.terminates(best);
+        tier("disjunctive", best.size(), __t);
+        if (disj) {
             if (DEBUG) System.err.println("  proved by a transition invariant (disjunctive)");
             return record(proofs, proof, "transition invariant (disjunctive)", null);
         }

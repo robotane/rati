@@ -37,8 +37,11 @@ import fr.univreunion.rati.its.ItsTransition;
  */
 final class MultiphaseRanking {
 
-    /** Max MΦRF depth attempted (number of phases). */
-    private static final int MAX_DEPTH = 4;
+    /** Max MΦRF depth attempted (number of phases). Tunable for an exotic deep phase
+     *  loop; the degenerate-grind cost is bounded by the tier-local pivot budget (see
+     *  {@link LinearProgram#MPHI_WORK_BUDGET}), not by capping depth, so full depth-4
+     *  capability is kept. */
+    private static final int MAX_DEPTH = Math.max(1, Integer.getInteger("rati.mphiMaxDepth", 4));
 
     private MultiphaseRanking() {}
 
@@ -52,11 +55,24 @@ final class MultiphaseRanking {
     static FarkasRanking.MphiCert rank(List<ItsTransition> transitions,
                        Map<String, List<ItsLinearConstraint>> invariants) {
         List<String> locs = locationsOf(transitions);
-        for (int d = 1; d <= MAX_DEPTH; d++) {
-            FarkasRanking.MphiCert r = new Builder(invariants, d, locs).extract(transitions);
-            if (r != null) return r;
+        // Bound the depth-1..MAX_DEPTH search with a tier-local pivot budget. On a loop that
+        // admits NO MΦRF the exact-rational nested-RF simplex degenerates into a multi-second
+        // grind whose pivots the GLOBAL budget is too coarse to bound (it is sized for the
+        // lexicographic tier, where a genuinely-hard proof like BubbleSort.sort legitimately
+        // spends ~15 s). Charged separately, so a degenerate MΦRF grind (Numerical3's gcd —
+        // ~5·10⁸ pivots / 20 s) is cut to a sub-second UNKNOWN while a real MΦRF rank (found
+        // fast, few pivots) and every lexicographic proof are untouched. Sound: exhaustion
+        // forgoes the MΦRF step (→ UNKNOWN), never fabricates a TERMINATES.
+        LinearProgram.beginMphiWindow();
+        try {
+            for (int d = 1; d <= MAX_DEPTH; d++) {
+                FarkasRanking.MphiCert r = new Builder(invariants, d, locs).extract(transitions);
+                if (r != null) return r;
+            }
+            return null;
+        } finally {
+            LinearProgram.endMphiWindow();
         }
-        return null;
     }
 
     /** True iff the SCC's transitions admit a MΦRF of depth ≤ {@link #MAX_DEPTH}. */

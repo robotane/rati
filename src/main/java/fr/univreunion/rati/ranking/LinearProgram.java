@@ -164,8 +164,33 @@ public final class LinearProgram {
         BuildBudgetExceeded() { super(null, null, false, false); }   // stackless
     }
 
+    /**
+     * Tier-local pivot budget for one multiphase (MΦRF) synthesis — the depth-1..d loop of
+     * {@link MultiphaseRanking#rank}. Kept SEPARATE from {@link #WORK_BUDGET} because the two
+     * tiers spend pivots at incomparable scales: a genuinely-hard <em>lexicographic</em> proof
+     * (BubbleSort.sort ≈15 s) legitimately charges hundreds of millions of pivots, so the
+     * global budget must stay high to clear it — but at that height it never bounds a
+     * <em>degenerate MΦRF</em> grind (Numerical3's gcd charges ~5·10⁸ pivots over ~20 s on an
+     * exact-rational nested-RF LP that admits no rank). Charging the MΦRF window against its
+     * own, far tighter budget cuts that grind to a sub-second UNKNOWN (measured: a 5·10⁷ cap
+     * turns gcd's 20 s MΦRF tier into ≈1 s) while leaving the lexicographic tier — and a real
+     * MΦRF rank, which is found fast and charges few pivots — untouched. Sound: exhaustion
+     * forgoes the step (→ UNKNOWN), never a false TERMINATES. {@code -Drati.mphiWorkBudget=N}
+     * overrides; {@code 0} disables (MΦRF then sees only the global cap). Active only between
+     * {@link #beginMphiWindow} and {@link #endMphiWindow}.
+     */
+    public static final long MPHI_WORK_BUDGET = Long.getLong("rati.mphiWorkBudget", 50_000_000L);
+    private static long mphiSpent;      // pivot work charged inside the current MΦRF window
+    private static boolean mphiActive;  // true between begin/endMphiWindow
+
     /** Opens a fresh work-budget window for one ranking attempt (a {@link FarkasRanking#prove}). */
     public static void beginProveWindow() { workSpent = 0; buildSpent = 0; }
+
+    /** Opens a fresh MΦRF pivot-budget window (one {@link MultiphaseRanking#rank} call). */
+    public static void beginMphiWindow() { mphiSpent = 0; mphiActive = MPHI_WORK_BUDGET > 0; }
+
+    /** Closes the MΦRF pivot-budget window. */
+    public static void endMphiWindow() { mphiActive = false; }
 
     /**
      * Charges {@code work} units of LP-setup effort (a solve's tableau area) and aborts the
@@ -193,8 +218,15 @@ public final class LinearProgram {
 
     /** Charges one pivot's worth of work and aborts the attempt if the budget is spent. */
     private static void chargePivot(int m, int cols) {
+        long work = (long) m * cols;
+        // Tier-local MΦRF budget (when a multiphase window is open): bounds a degenerate
+        // nested-RF grind without raising the global cap that clears the lexicographic tier.
+        if (mphiActive) {
+            mphiSpent += work;
+            if (mphiSpent > MPHI_WORK_BUDGET) throw new BudgetExceeded();
+        }
         if (WORK_BUDGET <= 0) return;
-        workSpent += (long) m * cols;
+        workSpent += work;
         if (workSpent > WORK_BUDGET) throw new BudgetExceeded();
     }
 
