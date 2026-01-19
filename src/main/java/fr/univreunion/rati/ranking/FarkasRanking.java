@@ -69,6 +69,50 @@ public final class FarkasRanking {
     }
 
     /**
+     * §8 worst-case-assumption budget: the maximum number of cyclic transitions an SCC may
+     * have before its precise (lexicographic / loop-summary / MΦRF / disjunctive) ranking
+     * synthesis is forgone. The cost of that synthesis is driven by the SCC's transition
+     * count: a many-transition mutually-recursive SCC (measured: Kitten's compiler translating
+     * its own AST yields a 181-transition SCC) builds a degenerate Farkas LP that grinds for
+     * tens of seconds — a cost <em>invariant</em> to dimension projection and transition
+     * chaining (both exact levers, both refuted by measurement). Rather than grind to a
+     * wall-clock cap (non-deterministic), an SCC over this budget is treated as unranked
+     * outright — the same UNKNOWN the grind would reach, but in microseconds and identically
+     * on every machine. This realises the TOPLAS §8 "worst-case assumption when complexity
+     * explodes" as a deterministic STRUCTURAL test, not a timer.
+     *
+     * <p>Sound: forgoing a ranking only ever forgoes a proof (→ UNKNOWN), never fabricates a
+     * false TERMINATES. The non-termination (recurrent-set) search is also skipped on such an
+     * SCC, since its LPs would grind for the same structural reason. Calibrate ABOVE every
+     * provable SCC in the corpus (with margin) so it bounds only a runaway. {@code
+     * -Drati.sccMaxTransitions=N} overrides; {@code 0} disables it (always attempt a ranking).
+     */
+    private static final int SCC_MAX_TRANSITIONS =
+            Integer.getInteger("rati.sccMaxTransitions", 0);
+
+    /**
+     * Per-METHOD companion to {@link #SCC_MAX_TRANSITIONS}: bounds the SUM of cyclic
+     * transitions across every non-trivial SCC of one prove, not just the largest one.
+     *
+     * <p>The per-SCC cap catches a single runaway SCC (Kitten's 181-transition
+     * {@code translate_*}), but the residual grind is dominated by methods with MANY
+     * moderate SCCs (measured: a context with 24 non-trivial SCCs, each ≤40 transitions)
+     * whose individual sizes never trip the per-SCC cap yet whose Farkas/MΦRF synthesis
+     * grinds in aggregate — the proof cost tracks the total transition count it must rank.
+     * This is the same TOPLAS §8 worst-case assumption applied to the whole method:
+     * over the total budget → sound UNKNOWN in microseconds, deterministically.
+     *
+     * <p>Sound for the same reason as the per-SCC cap: forgoing the ranking only forgoes a
+     * proof, never fabricates a TERMINATES. Calibrate above the largest provable Σ in the
+     * corpus. {@code -Drati.sccMaxTotalTransitions=N} overrides; {@code 0} disables it.
+     */
+    private static final int SCC_MAX_TOTAL_TRANSITIONS =
+            Integer.getInteger("rati.sccMaxTotalTransitions", 0);
+
+    /** Prints the largest SCC transition count per prove (calibration only, default OFF). */
+    private static final boolean SCC_MEASURE = Boolean.getBoolean("rati.sccMeasure");
+
+    /**
      * Reachable-location cap above which the Apron invariant pre-pass
      * ({@link ItsInvariants#compute}) is skipped. That pass is a per-location
      * join/widening worklist of ≈{@code 200·|reachable|} native polyhedral
@@ -179,6 +223,28 @@ public final class FarkasRanking {
         return prove(its, entryLocation, null).verdict;
     }
 
+    /**
+     * Deterministic structural metric: the largest number of cyclic transitions in
+     * any non-trivial SCC of the reachable sub-graph, after dropping infeasible
+     * (never-firing) cyclic edges. Reuses exactly the Tarjan decomposition and the
+     * first pruning pass of {@link #prove}, so it is the same signal the §8
+     * {@code rati.sccMaxTransitions} cap thresholds against. Returns 0 when there is
+     * no loop. Machine-independent (graph shape only) — used to GATE the
+     * {@code chainOnly} transform so its composition cost is paid only on the heavy
+     * methods that benefit, not blanket across the easy mass (see RankMain).
+     */
+    public static int maxSccTransitions(IntegerTransitionSystem its, String entryLocation) {
+        if (entryLocation == null || its.location(entryLocation) == null) return 0;
+        Set<String> reachable = reachableFrom(its, entryLocation);
+        Map<String, Integer> scc = tarjan(its, reachable);
+        Map<Integer, List<ItsTransition>> cyclic = new LinkedHashMap<Integer, List<ItsTransition>>();
+        Set<Integer> nonTrivial = nonTrivialSccs(its, reachable, scc, cyclic);
+        for (List<ItsTransition> ts : cyclic.values()) ts.removeIf(ItsInvariants::isInfeasible);
+        int max = 0;
+        for (Integer c : nonTrivial) max = Math.max(max, cyclic.get(c).size());
+        return max;
+    }
+
     private static Certificate prove(IntegerTransitionSystem its, String entryLocation,
             List<SccProof> proofs) {
         List<SccProof> outProofs = proofs == null ? new ArrayList<SccProof>() : proofs;
@@ -277,12 +343,45 @@ public final class FarkasRanking {
         // budget: a pathological SCC whose Farkas LPs blow up in construction (before any
         // pivot) throws BuildBudgetExceeded, which we turn into a bounded, deterministic
         // UNKNOWN — sound, since abandoning the search only ever forgoes a proof.
+        int totalScc = 0;
+        for (Integer comp : nonTrivial) totalScc += cyclic.get(comp).size();
+        if (SCC_MEASURE) {
+            int maxScc = 0;
+            for (Integer comp : nonTrivial) maxScc = Math.max(maxScc, cyclic.get(comp).size());
+            System.err.println("[scc-measure] entry=" + entryLocation
+                    + " maxSccTransitions=" + maxScc + " totalSccTransitions=" + totalScc
+                    + " nonTrivialSCCs=" + nonTrivial.size());
+        }
+        // §8 worst-case assumption, per-method: a prove whose SCCs sum past the total budget
+        // is forgone before any synthesis runs. Catches the many-moderate-SCC methods that the
+        // per-SCC cap misses. Deterministic, sound (forgoing a ranking only forgoes a proof).
+        if (SCC_MAX_TOTAL_TRANSITIONS > 0 && totalScc > SCC_MAX_TOTAL_TRANSITIONS) {
+            if (DEBUG || SCC_MEASURE)
+                System.err.println("[scc-complexity] total " + totalScc + " transitions over "
+                        + nonTrivial.size() + " SCCs > " + SCC_MAX_TOTAL_TRANSITIONS
+                        + " — worst-case assumption (UNKNOWN, no grind)");
+            return new Certificate(Verdict.UNKNOWN, outProofs);
+        }
         try {
             List<List<ItsTransition>> unranked = new ArrayList<List<ItsTransition>>();
             for (Integer comp : nonTrivial) {
+                List<ItsTransition> sccTrans = cyclic.get(comp);
+                // §8 worst-case assumption: an over-budget SCC is forgone outright. One
+                // unrankable SCC already rules out TERMINATES for the whole method, so we
+                // return UNKNOWN immediately — no ranking, no non-termination search on any
+                // SCC — a deterministic, microsecond punt with no grind. (Returning early
+                // rather than ranking the remaining SCCs cannot change the verdict and keeps
+                // the cap a strict speedup over the wall-clock abort it replaces.)
+                if (SCC_MAX_TRANSITIONS > 0 && sccTrans.size() > SCC_MAX_TRANSITIONS) {
+                    if (DEBUG || SCC_MEASURE)
+                        System.err.println("[scc-complexity] SCC of " + sccTrans.size()
+                                + " transitions > " + SCC_MAX_TRANSITIONS
+                                + " — worst-case assumption (UNKNOWN, no grind)");
+                    return new Certificate(Verdict.UNKNOWN, outProofs);
+                }
                 if (unsupportedReachable
-                        || rankScc(its, invariants, cyclic.get(comp), proofs) != Verdict.TERMINATES)
-                    unranked.add(cyclic.get(comp));
+                        || rankScc(its, invariants, sccTrans, proofs) != Verdict.TERMINATES)
+                    unranked.add(sccTrans);
             }
             if (DEBUG) System.err.println("[ranking] buildWork=" + LinearProgram.buildSpent());
             if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
