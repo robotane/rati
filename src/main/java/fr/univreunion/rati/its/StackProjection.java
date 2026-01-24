@@ -84,6 +84,32 @@ public final class StackProjection {
         }
     }
 
+    /**
+     * Narrow transition <b>chaining</b>: collapse single-in / single-out
+     * pass-through locations by exact relation composition, <em>without</em>
+     * projecting the stack and <em>without</em> the aggressive feedback-vertex-set
+     * of {@link #project}. Each contraction strictly reduces the edge count, so it
+     * cannot blow past the {@code MAX_EDGES} cap the way whole-graph FVS
+     * composition does (which is why {@code project} falls back on the largest
+     * Kitten SCCs and leaves them unchanged). Keeps every state dimension (locals
+     * and stack); only intermediate pass-through locations disappear, shrinking the
+     * number of locations — i.e. lexicographic ranking templates — and the count of
+     * thin per-bytecode transitions inside a strongly-connected component.
+     *
+     * <p>Sound, same argument as {@link #project}: composition over-approximates,
+     * so a ranking proof on the chained system transfers to the original, and a
+     * non-termination witness must be downgraded to UNKNOWN by the caller.
+     */
+    public static IntegerTransitionSystem chain(IntegerTransitionSystem its) {
+        try {
+            return chainOrThrow(its);
+        } catch (Fallback f) {
+            return its;
+        } catch (RuntimeException e) {
+            return its;                                 // never corrupt the analysis
+        }
+    }
+
     private static final class Fallback extends RuntimeException {
         Fallback(String m) { super(m); }
     }
@@ -149,6 +175,110 @@ public final class StackProjection {
             if (pt != null) out.addTransition(pt);
         }
         return out;
+    }
+
+    private static IntegerTransitionSystem chainOrThrow(IntegerTransitionSystem its) {
+        if (its.hasUnsupportedTransition()) throw new Fallback("unsupported transition");
+
+        String entry = its.entryLocation();
+        Set<String> reachable = reachableFrom(its, entry);
+
+        List<Rel> edges = new ArrayList<Rel>();
+        for (ItsTransition t : its.transitions()) {
+            if (!reachable.contains(t.source().name())) continue;
+            edges.add(toRel(t));
+        }
+        edges = chainContract(edges, entry);
+
+        // Surviving locations keep their FULL variable vector (locals + stack).
+        IntegerTransitionSystem out = new IntegerTransitionSystem(its.name(), entry);
+        Map<String, ItsLocation> newLoc = new LinkedHashMap<String, ItsLocation>();
+        Set<String> live = new LinkedHashSet<String>();
+        live.add(entry);
+        for (Rel r : edges) { live.add(r.src); live.add(r.tgt); }
+        for (String name : live) {
+            ItsLocation src = its.location(name);
+            if (src == null) throw new Fallback("dangling location");
+            ItsLocation nl = new ItsLocation(name, src.variables());
+            newLoc.put(name, nl);
+            out.addLocation(nl);
+        }
+        for (Rel r : edges) {
+            ItsTransition pt = rebuildKeepStack(r, newLoc);
+            if (pt != null) out.addTransition(pt);
+        }
+        return out;
+    }
+
+    /**
+     * Iteratively eliminate single-in or single-out (non-entry, non-self-loop)
+     * locations by composing their in-edges with their out-edges. With
+     * {@code indeg==1} or {@code outdeg==1} the product {@code |in|*|out|} never
+     * exceeds {@code max(|in|,|out|)}, so the edge count is non-increasing — no
+     * blow-up. Each step removes one location, so the loop terminates.
+     */
+    private static List<Rel> chainContract(List<Rel> edges, String entry) {
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            Map<String, Integer> indeg = new LinkedHashMap<String, Integer>();
+            Map<String, Integer> outdeg = new LinkedHashMap<String, Integer>();
+            Set<String> nodes = new LinkedHashSet<String>();
+            for (Rel e : edges) {
+                indeg.put(e.tgt, indeg.getOrDefault(e.tgt, 0) + 1);
+                outdeg.put(e.src, outdeg.getOrDefault(e.src, 0) + 1);
+                nodes.add(e.src); nodes.add(e.tgt);
+            }
+            for (String L : nodes) {
+                if (L.equals(entry)) continue;
+                int din = indeg.getOrDefault(L, 0), dout = outdeg.getOrDefault(L, 0);
+                if (din == 0 || dout == 0) continue;          // source/sink: leave it
+                if (din != 1 && dout != 1) continue;          // genuine branch+merge
+                List<Rel> in = new ArrayList<Rel>(), outE = new ArrayList<Rel>(),
+                          rest = new ArrayList<Rel>();
+                boolean self = false;
+                for (Rel e : edges) {
+                    boolean si = e.src.equals(L), ti = e.tgt.equals(L);
+                    if (si && ti) { self = true; break; }
+                    if (ti) in.add(e);
+                    else if (si) outE.add(e);
+                    else rest.add(e);
+                }
+                if (self) continue;                            // the loop head IS the cut
+                List<Rel> next = rest;
+                for (Rel a : in)
+                    for (Rel b : outE)
+                        next.add(compose(a, b));
+                if (next.size() > MAX_EDGES) throw new Fallback("edge blow-up");
+                edges = next;
+                changed = true;
+                break;
+            }
+        }
+        return edges;
+    }
+
+    /** Rebuild a composed edge as a transition over the FULL state (locals + stack). */
+    private static ItsTransition rebuildKeepStack(Rel r, Map<String, ItsLocation> newLoc) {
+        ItsLocation src = newLoc.get(r.src), tgt = newLoc.get(r.tgt);
+        if (src == null || tgt == null) throw new Fallback("dangling edge");
+
+        // P#<arg> -> fresh nondeterministic output var (LI*->LO*, SI*->SO*).
+        List<ItsLinearExpression> updates = new ArrayList<ItsLinearExpression>();
+        Map<String, String> rename = new LinkedHashMap<String, String>();
+        for (String arg : tgt.variables()) {
+            String outVar = (arg.startsWith("LI") ? "LO" : "SO") + arg.substring(2);
+            rename.put(POST + arg, outVar);
+            updates.add(ItsLinearExpression.variable(outVar));
+        }
+        if (updates.size() != tgt.arity()) throw new Fallback("chained arity mismatch");
+
+        List<ItsLinearConstraint> guard = new ArrayList<ItsLinearConstraint>();
+        for (Row row : r.rows) {
+            ItsLinearConstraint c = row.toConstraint(rename);
+            if (c != null) guard.add(c);
+        }
+        return new ItsTransition(src, tgt, guard, updates, Math.max(1, r.cost), true);
     }
 
     private static List<String> localsOf(List<String> vars) {
