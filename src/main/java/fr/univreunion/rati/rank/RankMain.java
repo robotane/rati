@@ -82,14 +82,51 @@ public final class RankMain {
             return;
         }
 
+        // Faithful BINTERM cascade (Algorithm 1, TOPLAS 2010 §7): no-Apron SCT
+        // triage first, fast punt of oversized SCCs, then the Apron tiers only on
+        // the small residual. Opt-in (--binterm) for measurement; routes the whole
+        // verdict through BinTerm.analyze and bypasses the Farkas/Apron path below.
+        if (Boolean.getBoolean("rati.binterm")) {
+            fr.univreunion.rati.ranking.BinTerm.Result r =
+                    fr.univreunion.rati.ranking.BinTerm.analyze(parsed.its, start);
+            if (!quiet) System.out.println("[binterm] tier=" + r.tier + " " + r.detail);
+            if (r.terminates()) { System.out.println("TERMINATES"); System.exit(0); }
+            System.out.println("UNKNOWN"); System.exit(1);
+            return;
+        }
+
         // Optional §8 dimensionality cap: existentially eliminate the operand-stack
         // variables, keeping only local-to-local relations. Sound over-approximation
         // (see StackProjection); cuts the bignum blow-up that makes a few systems
         // (Ackermann, Numerical3) grind for tens of seconds in the rational LP.
         fr.univreunion.rati.its.IntegerTransitionSystem its = parsed.its;
+        boolean overApprox = false;   // an over-approximating transform was applied
         if (Boolean.getBoolean("rati.projectStack")) {
             its = fr.univreunion.rati.its.StackProjection.project(its);
             if (its.location(start) == null) its = parsed.its;   // defensive: keep entry
+            overApprox = true;
+        } else if (Boolean.getBoolean("rati.chainOnly")) {
+            // Narrow chaining: collapse single-in/single-out pass-through locations
+            // by exact composition, keeping the stack. Shrinks the per-bytecode
+            // transition mesh of a big SCC without the whole-graph FVS blow-up that
+            // makes projectStack fall back. Sound over-approximation (see chain()).
+            //
+            // Gated by -Drati.chainGate=N (default 0 = chain always): chain()'s
+            // composition cost is non-trivial on the FULL state (locals + stack), so
+            // a Kitten A/B showed blanket chaining is a net wall LOSS — it taxes the
+            // easy mass more than it saves on grinders. With N>0 we chain ONLY methods
+            // whose raw max-SCC cyclic-transition count >= N (the same deterministic,
+            // machine-independent §8 signal as the cap), so the cost is paid only
+            // where the LP grind makes it pay off.
+            int gate = Integer.getInteger("rati.chainGate", 0);
+            if (gate <= 0
+                    || fr.univreunion.rati.ranking.FarkasRanking.maxSccTransitions(its, start) >= gate) {
+                its = fr.univreunion.rati.its.StackProjection.chain(its);
+                if (its.location(start) == null) its = parsed.its;   // defensive: keep entry
+                overApprox = true;
+            }
+        }
+        if (overApprox) {
             String dump = System.getProperty("rati.dumpProjected");
             if (dump != null) {
                 try {
@@ -97,6 +134,41 @@ public final class RankMain {
                         fr.univreunion.rati.its.KoatPrinter.print(its, start)
                             .getBytes(StandardCharsets.UTF_8));
                 } catch (IOException e) { System.err.println("[rati] dump failed: " + e); }
+            }
+        }
+
+        // Tier-1 of the "pure Julia" cascade: the cheap,
+        // PTIME, no-Apron size-change test triages the easy SCCs in milliseconds
+        // before the heavyweight Farkas/Apron tier ever runs. Opt-in
+        // (-Drati.sctFirst), default OFF until the corpus sweep + CeTA byte-id bars
+        // are clean. It only SHORT-CIRCUITS a TERMINATES verdict; a NO answer falls
+        // through to Farkas unchanged (sound: SCT never claims false termination).
+        // When a CPF certificate is requested (--cpf) we do NOT short-circuit —
+        // SCT does not yet emit CPF, so the cert path stays on Farkas and CeTA
+        // output is byte-identical.
+        if (Boolean.getBoolean("rati.sctFirst") && cpfOut == null) {
+            fr.univreunion.rati.ranking.SizeChangeTermination.Result sct =
+                    fr.univreunion.rati.ranking.SizeChangeTermination.analyze(its, start);
+            if (sct.terminates()) {
+                // Optional instrumentation: append one line per short-circuit to the
+                // file named by -Drati.sctLog (counting SCT firings across a child-per-
+                // method run, where stderr is merged into the parsed stdout so a stderr
+                // marker would be swallowed). Off unless the property is set.
+                String sctLog = System.getProperty("rati.sctLog");
+                if (sctLog != null) {
+                    try {
+                        Files.write(Paths.get(sctLog),
+                                ("SCT " + start + " " + sct.sccProved + "\n")
+                                        .getBytes(StandardCharsets.UTF_8),
+                                java.nio.file.StandardOpenOption.CREATE,
+                                java.nio.file.StandardOpenOption.APPEND);
+                    } catch (IOException ignored) { /* counting is best-effort */ }
+                }
+                System.out.println("TERMINATES");
+                if (!quiet) System.out.println("certificate: size-change termination ("
+                        + sct.sccProved + " SCC(s) proved; no idempotent self-graph "
+                        + "lacks an in-situ strict thread)");
+                System.exit(0);
             }
         }
 
@@ -127,11 +199,12 @@ public final class RankMain {
             if (!quiet) printCertificate(cert);
             if (cpfOut != null) writeCpf(its, start, cert, cpfOut);
             System.exit(0);
-        } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES
-                && !Boolean.getBoolean("rati.projectStack")) {
+        } else if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES && !overApprox) {
             // A NONTERMINATES verdict is only sound on the exact (or under-approximated)
-            // system. Stack projection is an OVER-approximation, so a recurrent set it
-            // exposes can be spurious — downgrade to UNKNOWN when projecting.
+            // system. Stack projection / chaining is an OVER-approximation, so a recurrent
+            // set it exposes can be spurious — downgrade to UNKNOWN when one was applied.
+            // (When chainGate skips chaining, overApprox stays false and a non-termination
+            // witness on the exact system is reported as before — strictly more precise.)
             System.out.println("NONTERMINATES");
             if (!quiet) printNonTermination(cert.nonTermination);
             System.exit(3);
