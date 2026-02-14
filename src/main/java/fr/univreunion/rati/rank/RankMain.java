@@ -172,6 +172,18 @@ public final class RankMain {
             }
         }
 
+        // Optional calibration instrumentation (off unless -Drati.proveLog is set):
+        // record the raw (un-chained) max-SCC transition count BEFORE the prove, so a
+        // method killed by the wall cap still leaves its maxScc on a "PRE" line; the
+        // "DONE" line after the prove adds the elapsed ms + verdict. A single run thus
+        // yields the (maxScc, time) separation used to choose -Drati.chainGate, with the
+        // heaviest grinders (the ones that benefit most from chaining) still covered.
+        String proveLog = System.getProperty("rati.proveLog");
+        int rawMaxScc = proveLog == null ? -1
+                : FarkasRanking.maxSccTransitions(parsed.its, start);
+        if (proveLog != null) appendLine(proveLog, start + " " + rawMaxScc + " PRE");
+
+        long proveT0 = System.nanoTime();
         FarkasRanking.Certificate cert;
         try {
             cert = FarkasRanking.proveWithCertificate(its, start);
@@ -194,6 +206,11 @@ public final class RankMain {
             return;
         }
 
+        if (proveLog != null) {
+            long ms = (System.nanoTime() - proveT0) / 1_000_000L;
+            appendLine(proveLog, start + " " + rawMaxScc + " " + ms + " " + cert.verdict);
+        }
+
         if (cert.verdict == FarkasRanking.Verdict.TERMINATES) {
             System.out.println("TERMINATES");
             if (!quiet) printCertificate(cert);
@@ -212,6 +229,15 @@ public final class RankMain {
             System.out.println("UNKNOWN");
             System.exit(1);
         }
+    }
+
+    /** Best-effort atomic append of one line (+newline) to an instrumentation file. */
+    private static void appendLine(String file, String line) {
+        try {
+            Files.write(Paths.get(file), (line + "\n").getBytes(StandardCharsets.UTF_8),
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.APPEND);
+        } catch (IOException ignored) { /* counting is best-effort */ }
     }
 
     private static void printNonTermination(NonTermination.Witness w) {
