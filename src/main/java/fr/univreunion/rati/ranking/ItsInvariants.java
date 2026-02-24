@@ -68,10 +68,17 @@ public final class ItsInvariants {
      *
      * <p>Calibrated on the Julia09 corpus: the heaviest invariant-dependent proof
      * (KnapsackDP.SolveDP) charges ≈4.2·10³, every other proof less, while a dense Kitten
-     * visitor SCC passes 1.2·10⁵. The {@code 5·10⁴} default clears every measured proof
-     * (≈12× margin) yet bounds the grinder's fixpoint.
+     * visitor SCC passes 1.2·10⁵. The {@code 1·10⁴} default clears every measured proof
+     * (≈2.4× margin) yet bounds the grinder's fixpoint much sooner than the headroom alone
+     * would suggest is safe: a Kitten (774) + Julia09 (36) sweep at 5·10⁴ → 1·10⁴ → 5·10³
+     * → 2·10³ left the verdict of every one of the 810 methods byte-identical (664
+     * TERMINATES / 137 UNKNOWN at every budget — the grinders pass the budget without it
+     * ever buying them a proof), while cutting the aggregate rati wall by 37% at 1·10⁴
+     * (≈50% at 2·10³). 1·10⁴ banks the bulk of that win at a comfortable margin over the
+     * heaviest real proof; tighten further (down to ≈3·10³) only with a fresh CeTA byte-id
+     * check, since a dropped invariant can change a certificate even when the verdict holds.
      */
-    private static final long INV_OP_BUDGET = Long.getLong("rati.invariantOpBudget", 50_000L);
+    private static final long INV_OP_BUDGET = Long.getLong("rati.invariantOpBudget", 10_000L);
 
     private final Manager man = ApronManagers.POLKA;
     private long invOpSpent;   // per-compute cumulative post-image work; single-threaded
