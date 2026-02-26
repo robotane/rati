@@ -118,7 +118,24 @@ public final class LinearProgram {
      * it; {@code 0} disables the cap.
      */
     public static final long WORK_BUDGET = Long.getLong("rati.workBudget", 1_500_000_000L);
-    private static long workSpent;   // per-attempt cumulative; single-threaded (ActiveProcessorCount=1)
+
+    /**
+     * All mutable budget counters, held <em>per thread</em>. RaTI was written for
+     * single-threaded use (one process per proof), but bcterm now drives the engine
+     * in-process from a parallel ranking cascade ({@code bcterm.rankParallel}). With the
+     * counters as plain statics, one thread's {@link #endMphiWindow} would clear another
+     * thread's open window mid-{@code solve()}, so the MΦRF pivot budget never fired and a
+     * degenerate grind ran unbounded (Numerical3.main ≈ 60 s). Per-thread state restores the
+     * budgets under concurrency without any locking. (Mirrors the per-thread Apron managers.)
+     */
+    private static final class Budget {
+        long workSpent;        // per-attempt cumulative LP work
+        long buildSpent;       // per-attempt cumulative LP-setup work
+        long mphiSpent;        // pivot work charged inside the current MΦRF window
+        boolean mphiActive;    // true between begin/endMphiWindow
+    }
+    private static final ThreadLocal<Budget> BUDGET = ThreadLocal.withInitial(Budget::new);
+    private static Budget b() { return BUDGET.get(); }
 
     /**
      * Cumulative budget, <em>per ranking attempt</em>, on LP <em>setup</em> work — the
@@ -147,7 +164,6 @@ public final class LinearProgram {
      * yet bounds the grinder to a sub-second UNKNOWN.
      */
     public static final long BUILD_BUDGET = Long.getLong("rati.buildBudget", 10_000_000L);
-    private static long buildSpent;   // per-attempt cumulative LP-setup work
 
     /** Thrown when an attempt exceeds {@link #WORK_BUDGET}; caught in {@link #solve()}. */
     private static final class BudgetExceeded extends RuntimeException {
@@ -180,17 +196,18 @@ public final class LinearProgram {
      * {@link #beginMphiWindow} and {@link #endMphiWindow}.
      */
     public static final long MPHI_WORK_BUDGET = Long.getLong("rati.mphiWorkBudget", 50_000_000L);
-    private static long mphiSpent;      // pivot work charged inside the current MΦRF window
-    private static boolean mphiActive;  // true between begin/endMphiWindow
 
     /** Opens a fresh work-budget window for one ranking attempt (a {@link FarkasRanking#prove}). */
-    public static void beginProveWindow() { workSpent = 0; buildSpent = 0; }
+    public static void beginProveWindow() { Budget bd = b(); bd.workSpent = 0; bd.buildSpent = 0; }
 
     /** Opens a fresh MΦRF pivot-budget window (one {@link MultiphaseRanking#rank} call). */
-    public static void beginMphiWindow() { mphiSpent = 0; mphiActive = MPHI_WORK_BUDGET > 0; }
+    public static void beginMphiWindow() {
+        Budget bd = b();
+        bd.mphiSpent = 0; bd.mphiActive = MPHI_WORK_BUDGET > 0;
+    }
 
     /** Closes the MΦRF pivot-budget window. */
-    public static void endMphiWindow() { mphiActive = false; }
+    public static void endMphiWindow() { b().mphiActive = false; }
 
     /**
      * Charges {@code work} units of LP-setup effort (a solve's tableau area) and aborts the
@@ -200,12 +217,13 @@ public final class LinearProgram {
      */
     static void chargeBuild(long work) {
         if (BUILD_BUDGET <= 0) return;
-        buildSpent += work;
-        if (buildSpent > BUILD_BUDGET) throw new BuildBudgetExceeded();
+        Budget bd = b();
+        bd.buildSpent += work;
+        if (bd.buildSpent > BUILD_BUDGET) throw new BuildBudgetExceeded();
     }
 
     /** Construction work charged so far in the current attempt (diagnostics). */
-    static long buildSpent() { return buildSpent; }
+    static long buildSpent() { return b().buildSpent; }
 
     public Solution solve() {
         if (WORK_BUDGET <= 0) return USE_BAREISS ? solveFractionFree() : solveRational();
@@ -218,16 +236,17 @@ public final class LinearProgram {
 
     /** Charges one pivot's worth of work and aborts the attempt if the budget is spent. */
     private static void chargePivot(int m, int cols) {
+        Budget bd = b();
         long work = (long) m * cols;
         // Tier-local MΦRF budget (when a multiphase window is open): bounds a degenerate
         // nested-RF grind without raising the global cap that clears the lexicographic tier.
-        if (mphiActive) {
-            mphiSpent += work;
-            if (mphiSpent > MPHI_WORK_BUDGET) throw new BudgetExceeded();
+        if (bd.mphiActive) {
+            bd.mphiSpent += work;
+            if (bd.mphiSpent > MPHI_WORK_BUDGET) throw new BudgetExceeded();
         }
         if (WORK_BUDGET <= 0) return;
-        workSpent += work;
-        if (workSpent > WORK_BUDGET) throw new BudgetExceeded();
+        bd.workSpent += work;
+        if (bd.workSpent > WORK_BUDGET) throw new BudgetExceeded();
     }
 
     public Solution solveRational() {
