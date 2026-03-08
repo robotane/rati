@@ -52,7 +52,7 @@ final class DisjunctiveTermination {
     private static final int MAX_RELATIONS = 12;
 
     /** Strict polyhedra (Polka true) so the union-complement {@code f < 0} is exact. */
-    private final Manager man = ApronManagers.POLKA_STRICT;
+    private final Manager man = ApronManagers.polkaStrict();
     private final int n;                       // state dimension (cut-point arity)
 
     private DisjunctiveTermination(int n) { this.n = n; }

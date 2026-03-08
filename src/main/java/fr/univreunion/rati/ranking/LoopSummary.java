@@ -42,7 +42,7 @@ public final class LoopSummary {
     /** Bail-out: composition can blow up multiplicatively; above this, give up (sound: caller ranks the raw SCC). */
     private static final int MAX_EDGES = 600;
 
-    private final Manager man = ApronManagers.POLKA;
+    private final Manager man = ApronManagers.polka();
 
     private LoopSummary() {}
 

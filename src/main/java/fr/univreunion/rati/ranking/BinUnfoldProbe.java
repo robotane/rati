@@ -64,7 +64,8 @@ import fr.univreunion.rati.rank.KoatParser;
  */
 public final class BinUnfoldProbe {
 
-    private static final Manager MAN = ApronManagers.POLKA;
+    /** This thread's polyhedra manager (per-thread for race-free in-process use). */
+    private static Manager man() { return ApronManagers.polka(); }
     private static final int WIDEN_DELAY = 3;
     private static final long PER_HEADER_MS = 20_000;
 
@@ -186,8 +187,8 @@ public final class BinUnfoldProbe {
     static List<ItsLinearConstraint> loopRelation(IntegerTransitionSystem its, Set<String> scc,
             Map<String, List<ItsTransition>> bySource, String h, long perHeaderMs) throws ApronException {
         Abstract1 loopRel = closeHeaderRel(its, scc, bySource, h, perHeaderMs).loopRel;
-        if (loopRel.isBottom(MAN)) return null;
-        return ApronBridge.toConstraints(MAN, loopRel);
+        if (loopRel.isBottom(man())) return null;
+        return ApronBridge.toConstraints(man(), loopRel);
     }
 
     /** Runs the widened forward relational closure from {@code h} and returns R_hh. */
@@ -205,7 +206,7 @@ public final class BinUnfoldProbe {
 
         // Rel[loc] : polyhedron over (I@hf ∪ C@locFormals). ⊥ initially, identity at h.
         Map<String, Abstract1> rel = new HashMap<String, Abstract1>();
-        for (String loc : scc) rel.put(loc, new Abstract1(MAN, envIC(iSide, its.location(loc)), true));
+        for (String loc : scc) rel.put(loc, new Abstract1(man(), envIC(iSide, its.location(loc)), true));
         rel.put(h, identity(iSide, hf));
 
         Map<String, Integer> visits = new HashMap<String, Integer>();
@@ -219,16 +220,16 @@ public final class BinUnfoldProbe {
             iters++;
             String loc = work.poll(); inWork.remove(loc);
             Abstract1 src = rel.get(loc);
-            if (src.isBottom(MAN)) continue;
+            if (src.isBottom(man())) continue;
             for (ItsTransition t : bySource.getOrDefault(loc, Collections.emptyList())) {
                 String tgt = t.target().name();
                 if (!scc.contains(tgt)) continue;
                 Abstract1 post = relPost(src, t, iSide);
                 Abstract1 old = rel.get(tgt);
-                Abstract1 joined = old.joinCopy(MAN, post);
+                Abstract1 joined = old.joinCopy(man(), post);
                 int v = visits.getOrDefault(tgt, 0) + 1; visits.put(tgt, v);
-                if (v > WIDEN_DELAY) joined = old.widening(MAN, joined);
-                if (!joined.isIncluded(MAN, old)) {
+                if (v > WIDEN_DELAY) joined = old.widening(man(), joined);
+                if (!joined.isIncluded(man(), old)) {
                     rel.put(tgt, joined);
                     if (inWork.add(tgt)) work.add(tgt);
                 }
@@ -238,11 +239,11 @@ public final class BinUnfoldProbe {
 
         // R_hh = ⊔ over in-edges (src -> h) of relPost(Rel[src], edge). The ≥1-step
         // loop relation: h's call-time args (I@) related to h's next-visit args (C@).
-        Abstract1 loopRel = new Abstract1(MAN, envIC(iSide, its.location(h)), true);
+        Abstract1 loopRel = new Abstract1(man(), envIC(iSide, its.location(h)), true);
         for (String s : scc)
             for (ItsTransition t : bySource.getOrDefault(s, Collections.emptyList()))
-                if (t.target().name().equals(h) && !rel.get(s).isBottom(MAN))
-                    loopRel = loopRel.joinCopy(MAN, relPost(rel.get(s), t, iSide));
+                if (t.target().name().equals(h) && !rel.get(s).isBottom(man()))
+                    loopRel = loopRel.joinCopy(man(), relPost(rel.get(s), t, iSide));
 
         return new Closure(loopRel, iters, converged, System.currentTimeMillis() - start);
     }
@@ -257,13 +258,13 @@ public final class BinUnfoldProbe {
         res.iterations = cl.iterations;
         res.converged = cl.converged;
 
-        res.numConstraints = loopRel.isBottom(MAN) ? 0 : ApronBridge.toConstraints(MAN, loopRel).size();
+        res.numConstraints = loopRel.isBottom(man()) ? 0 : ApronBridge.toConstraints(man(), loopRel).size();
         res.millis = cl.millis;
 
-        if (dump && !loopRel.isBottom(MAN)) {
+        if (dump && !loopRel.isBottom(man())) {
             System.out.println("  --- R_hh for " + h + " ---");
             int shown = 0, decreasing = 0;
-            for (ItsLinearConstraint c : ApronBridge.toConstraints(MAN, loopRel)) {
+            for (ItsLinearConstraint c : ApronBridge.toConstraints(man(), loopRel)) {
                 // count how many constraints witness a per-variable strict decrease C@v < I@v
                 String s = c.toString();
                 if (shown++ < 50) System.out.println("    " + s);
@@ -285,7 +286,7 @@ public final class BinUnfoldProbe {
         }
 
         // Cheap 1-D rankability witness over R_hh.
-        if (!loopRel.isBottom(MAN)) {
+        if (!loopRel.isBottom(man())) {
             for (String v : hf) {
                 Map<String, BigInteger> dec = new LinkedHashMap<String, BigInteger>();
                 dec.put("I@" + v, BigInteger.ONE); dec.put("C@" + v, BigInteger.valueOf(-1));
@@ -307,7 +308,7 @@ public final class BinUnfoldProbe {
 
         // 1. Rename rel's C@srcFormals back to the raw guard names (LI0, SI0, …).
         String[] cFrom = pref("C@", sv);
-        Abstract1 a = sv.isEmpty() ? rel : rel.renameCopy(MAN, cFrom.clone(), sv.toArray(new String[0]));
+        Abstract1 a = sv.isEmpty() ? rel : rel.renameCopy(man(), cFrom.clone(), sv.toArray(new String[0]));
 
         // 2. Full env: I@* ∪ raw src formals ∪ guard/update vars ∪ fresh res.
         Set<String> names = new LinkedHashSet<String>();
@@ -318,21 +319,21 @@ public final class BinUnfoldProbe {
         String[] resv = new String[tv.size()];
         for (int j = 0; j < resv.length; j++) { resv[j] = "__r" + j; names.add(resv[j]); }
         Environment full = new Environment(new String[0], names.toArray(new String[0]));
-        a = a.changeEnvironmentCopy(MAN, full, false);
+        a = a.changeEnvironmentCopy(man(), full, false);
 
         // 3. Meet guard, bind res_j = update_j.
         List<Lincons1> cons = new ArrayList<Lincons1>();
         for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(full, c));
         for (int j = 0; j < resv.length; j++) cons.add(ApronBridge.bindEq(full, resv[j], t.updates().get(j)));
-        if (!cons.isEmpty()) a = a.meetCopy(MAN, cons.toArray(new Lincons1[0]));
+        if (!cons.isEmpty()) a = a.meetCopy(man(), cons.toArray(new Lincons1[0]));
 
         // 4. Project to I@* ∪ res*, rename res_j → C@tgtFormals_j.
         Set<String> keep = new LinkedHashSet<String>();
         Collections.addAll(keep, iSide);
         Collections.addAll(keep, resv);
-        a = a.changeEnvironmentCopy(MAN, new Environment(new String[0], keep.toArray(new String[0])), true);
-        if (resv.length > 0) a = a.renameCopy(MAN, resv.clone(), pref("C@", tv));
-        return a.changeEnvironmentCopy(MAN, envIC(iSide, t.target()), false);
+        a = a.changeEnvironmentCopy(man(), new Environment(new String[0], keep.toArray(new String[0])), true);
+        if (resv.length > 0) a = a.renameCopy(man(), resv.clone(), pref("C@", tv));
+        return a.changeEnvironmentCopy(man(), envIC(iSide, t.target()), false);
     }
 
     // --------------------------------------------------------------- Apron util
@@ -349,7 +350,7 @@ public final class BinUnfoldProbe {
         Collections.addAll(n, iSide);
         Collections.addAll(n, pref("C@", hf));
         Environment env = new Environment(new String[0], n.toArray(new String[0]));
-        Abstract1 a = new Abstract1(MAN, env);
+        Abstract1 a = new Abstract1(man(), env);
         List<Lincons1> cons = new ArrayList<Lincons1>();
         for (String v : hf) {
             Map<String, BigInteger> terms = new LinkedHashMap<String, BigInteger>();
@@ -357,7 +358,7 @@ public final class BinUnfoldProbe {
             terms.put("C@" + v, BigInteger.valueOf(-1));
             cons.add(new Lincons1(Lincons1.EQ, ApronBridge.linexpr(env, terms, BigInteger.ZERO)));
         }
-        return cons.isEmpty() ? a : a.meetCopy(MAN, cons.toArray(new Lincons1[0]));
+        return cons.isEmpty() ? a : a.meetCopy(man(), cons.toArray(new Lincons1[0]));
     }
 
     /**
@@ -369,7 +370,7 @@ public final class BinUnfoldProbe {
         Map<String, BigInteger> neg = new LinkedHashMap<String, BigInteger>();
         for (Map.Entry<String, BigInteger> e : terms.entrySet()) neg.put(e.getKey(), e.getValue().negate());
         Linexpr1 le = ApronBridge.linexpr(a.getEnvironment(), neg, c.negate().subtract(BigInteger.ONE));
-        return a.meetCopy(MAN, new Lincons1(Lincons1.SUPEQ, le)).isBottom(MAN);
+        return a.meetCopy(man(), new Lincons1(Lincons1.SUPEQ, le)).isBottom(man());
     }
 
     private static String[] pref(String p, List<String> vs) {

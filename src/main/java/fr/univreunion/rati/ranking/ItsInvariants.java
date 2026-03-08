@@ -80,7 +80,7 @@ public final class ItsInvariants {
      */
     private static final long INV_OP_BUDGET = Long.getLong("rati.invariantOpBudget", 10_000L);
 
-    private final Manager man = ApronManagers.POLKA;
+    private final Manager man = ApronManagers.polka();
     private long invOpSpent;   // per-compute cumulative post-image work; single-threaded
 
     private ItsInvariants() {}
@@ -101,7 +101,7 @@ public final class ItsInvariants {
      */
     public static boolean isInfeasible(ItsTransition t) {
         try {
-            Manager man = ApronManagers.POLKA;
+            Manager man = ApronManagers.polka();
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             for (ItsLinearConstraint c : t.constraints()) names.addAll(c.lhs().variables());
             Environment env = new Environment(new String[0], names.toArray(new String[0]));
@@ -135,7 +135,7 @@ public final class ItsInvariants {
     public static boolean isInfeasibleUnder(ItsTransition t, List<ItsLinearConstraint> srcInvariant) {
         if (srcInvariant == null || srcInvariant.isEmpty()) return isInfeasible(t);
         try {
-            Manager man = ApronManagers.POLKA;
+            Manager man = ApronManagers.polka();
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             for (ItsLinearConstraint c : t.constraints()) names.addAll(c.lhs().variables());
             for (ItsLinearConstraint c : srcInvariant) names.addAll(c.lhs().variables());
@@ -164,7 +164,7 @@ public final class ItsInvariants {
     public static boolean entailsNonNegative(List<ItsLinearExpression> premises,
                                              Map<String, Long> rhoTerms, long rhoConst) {
         try {
-            Manager man = ApronManagers.POLKA;
+            Manager man = ApronManagers.polka();
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             if (premises != null) for (ItsLinearExpression p : premises) names.addAll(p.variables());
             names.addAll(rhoTerms.keySet());

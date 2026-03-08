@@ -36,6 +36,78 @@ public final class RankMain {
 
     private RankMain() {}
 
+    /**
+     * Computes the bare termination exit code for a KoAT-format ITS — {@code 0}
+     * TERMINATES, {@code 1} UNKNOWN, {@code 2} usage/parse/setup error, {@code 3}
+     * NONTERMINATES — applying the <em>same</em> property-gated cascade as
+     * {@link #main} (binterm → projectStack|chainOnly → sctFirst → Farkas) but
+     * performing no printing, no CPF export, no instrumentation, and never calling
+     * {@link System#exit}. It is the in-process face of the CLI: an embedding
+     * analyser (BCTerm's {@code RatiProver}) can call it directly instead of forking
+     * a JVM, and because both entry points run the identical cascade the forked and
+     * in-process verdicts cannot drift. The properties (e.g. {@code rati.sctFirst},
+     * {@code rati.projectStack}) are read from the live JVM, exactly as {@link #main}
+     * reads them, so an embedder controls the cascade by setting them on its own JVM.
+     *
+     * @param text  the KoAT-format ITS source
+     * @param entryOverride mirrors {@code --entry}: the start functor, or {@code null}
+     *        to use the ITS's own {@code (STARTTERM …)}
+     */
+    public static int proveExitCode(String text, String entryOverride) {
+        KoatParser.Parsed parsed;
+        try {
+            parsed = KoatParser.parse(text);
+        } catch (RuntimeException e) {
+            return 2;   // malformed input is a usage error, not an analysis outcome
+        }
+        String start = entryOverride != null ? entryOverride : parsed.start;
+        if (start == null || parsed.its.location(start) == null) return 2;
+
+        if (Boolean.getBoolean("rati.binterm")) {
+            fr.univreunion.rati.ranking.BinTerm.Result r =
+                    fr.univreunion.rati.ranking.BinTerm.analyze(parsed.its, start);
+            return r.terminates() ? 0 : 1;
+        }
+
+        // §8 over-approximating transforms (see main() for the rationale of each gate).
+        fr.univreunion.rati.its.IntegerTransitionSystem its = parsed.its;
+        boolean overApprox = false;
+        if (Boolean.getBoolean("rati.projectStack")) {
+            its = fr.univreunion.rati.its.StackProjection.project(its);
+            if (its.location(start) == null) its = parsed.its;
+            overApprox = true;
+        } else if (Boolean.getBoolean("rati.chainOnly")) {
+            int gate = Integer.getInteger("rati.chainGate", 0);
+            if (gate <= 0 || FarkasRanking.maxSccTransitions(its, start) >= gate) {
+                its = fr.univreunion.rati.its.StackProjection.chain(its);
+                if (its.location(start) == null) its = parsed.its;
+                overApprox = true;
+            }
+        }
+
+        // No-Apron size-change triage (short-circuits a TERMINATES; a NO falls through).
+        if (Boolean.getBoolean("rati.sctFirst")) {
+            fr.univreunion.rati.ranking.SizeChangeTermination.Result sct =
+                    fr.univreunion.rati.ranking.SizeChangeTermination.analyze(its, start);
+            if (sct.terminates()) return 0;
+        }
+
+        FarkasRanking.Certificate cert;
+        try {
+            cert = FarkasRanking.proveWithCertificate(its, start);
+        } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
+            return 2;   // Apron native library not loaded — a setup error
+        } catch (RuntimeException e) {
+            return 1;   // a prover bug must not masquerade as a clean MAYBE → sound UNKNOWN
+        }
+
+        if (cert.verdict == FarkasRanking.Verdict.TERMINATES) return 0;
+        // A NONTERMINATES verdict is only sound on the exact (non-over-approximated)
+        // system; a witness on a projected/chained ITS may be spurious → UNKNOWN.
+        if (cert.verdict == FarkasRanking.Verdict.NONTERMINATES && !overApprox) return 3;
+        return 1;
+    }
+
     public static void main(String[] args) {
         String file = null, entry = null, cpfOut = null;
         boolean quiet = false;
