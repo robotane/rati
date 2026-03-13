@@ -62,25 +62,47 @@ public final class RankMain {
         }
         String start = entryOverride != null ? entryOverride : parsed.start;
         if (start == null || parsed.its.location(start) == null) return 2;
+        return proveExitCode(parsed.its, start);
+    }
+
+    /**
+     * Object-handoff face of {@link #proveExitCode(String, String)}: ranks an ITS that
+     * an embedder has already built in memory, skipping the KoAT text serialise/parse
+     * round-trip entirely. It runs the <em>identical</em> property-gated cascade
+     * (binterm → projectStack|chainOnly → sctFirst → Farkas) and returns the same exit
+     * codes, so a verdict obtained this way cannot drift from the forked CLI or the
+     * text entry point — the only difference is that the {@code its} was constructed
+     * directly rather than parsed from {@code (RULES …)}. The {@code its} must be the
+     * exact (non-over-approximated) system; the §8 transforms are applied here, exactly
+     * as the text path applies them to {@code parsed.its}.
+     *
+     * @param its   the integer transition system to rank (already built, not text)
+     * @param start the start functor; must be a location of {@code its}
+     * @return {@code 0} TERMINATES, {@code 1} UNKNOWN, {@code 2} usage/setup error,
+     *         {@code 3} NONTERMINATES
+     */
+    public static int proveExitCode(fr.univreunion.rati.its.IntegerTransitionSystem its0,
+            String start) {
+        if (its0 == null || start == null || its0.location(start) == null) return 2;
 
         if (Boolean.getBoolean("rati.binterm")) {
             fr.univreunion.rati.ranking.BinTerm.Result r =
-                    fr.univreunion.rati.ranking.BinTerm.analyze(parsed.its, start);
+                    fr.univreunion.rati.ranking.BinTerm.analyze(its0, start);
             return r.terminates() ? 0 : 1;
         }
 
         // §8 over-approximating transforms (see main() for the rationale of each gate).
-        fr.univreunion.rati.its.IntegerTransitionSystem its = parsed.its;
+        fr.univreunion.rati.its.IntegerTransitionSystem its = its0;
         boolean overApprox = false;
         if (Boolean.getBoolean("rati.projectStack")) {
             its = fr.univreunion.rati.its.StackProjection.project(its);
-            if (its.location(start) == null) its = parsed.its;
+            if (its.location(start) == null) its = its0;
             overApprox = true;
         } else if (Boolean.getBoolean("rati.chainOnly")) {
             int gate = Integer.getInteger("rati.chainGate", 0);
             if (gate <= 0 || FarkasRanking.maxSccTransitions(its, start) >= gate) {
                 its = fr.univreunion.rati.its.StackProjection.chain(its);
-                if (its.location(start) == null) its = parsed.its;
+                if (its.location(start) == null) its = its0;
                 overApprox = true;
             }
         }
