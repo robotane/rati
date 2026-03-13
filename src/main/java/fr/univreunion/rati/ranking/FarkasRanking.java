@@ -256,6 +256,7 @@ public final class FarkasRanking {
         // turning a minutes-long grind into a bounded, deterministic UNKNOWN.
         LinearProgram.beginProveWindow();
 
+        long __tsetup = System.nanoTime();
         Set<String> reachable = reachableFrom(its, entryLocation);
 
         // A reachable transition the model could not express faithfully rules a
@@ -282,6 +283,7 @@ public final class FarkasRanking {
         // otherwise sink an entire SCC into UNKNOWN.
         for (List<ItsTransition> ts : cyclic.values()) ts.removeIf(ItsInvariants::isInfeasible);
         nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
+        tier("eng-setup", reachable.size(), __tsetup);
 
         if (DEBUG) {
             int edges = 0;
@@ -311,12 +313,14 @@ public final class FarkasRanking {
                     + reachable.size() + " > " + INVARIANT_MAX_LOCS);
             invariants = java.util.Collections.emptyMap();
         } else {
+            long __ti = System.nanoTime();
             try {
                 invariants = ItsInvariants.compute(its, entryLocation, reachable);
             } catch (RuntimeException e) {
                 if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
                 invariants = java.util.Collections.emptyMap();
             }
+            tier("invariants", reachable.size(), __ti);
         }
 
         // Second pruning pass, now that per-location invariants are known: drop cyclic
@@ -329,10 +333,12 @@ public final class FarkasRanking {
         // lexicographic round and pushing the proof into the costly disjunctive fallback
         // (measured: Diff.dif 53s → 231s before this prune).
         if (!invariants.isEmpty()) {
+            long __tp2 = System.nanoTime();
             final Map<String, List<ItsLinearConstraint>> inv = invariants;
             for (List<ItsTransition> ts : cyclic.values())
                 ts.removeIf(t -> ItsInvariants.isInfeasibleUnder(t, inv.get(t.source().name())));
             nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
+            tier("eng-prune2", reachable.size(), __tp2);
             if (nonTrivial.isEmpty())
                 return new Certificate(unsupportedReachable ? Verdict.UNKNOWN : Verdict.TERMINATES, outProofs);
         }
