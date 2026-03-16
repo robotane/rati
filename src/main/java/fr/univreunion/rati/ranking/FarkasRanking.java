@@ -131,6 +131,20 @@ public final class FarkasRanking {
     private static final int INVARIANT_MAX_LOCS =
             Integer.getInteger("rati.invariantMaxLocations", 300);
 
+    /**
+     * Defer the supporting-invariant fixpoint until a first ranking pass (on the raw,
+     * only-infeasible-pruned SCCs) leaves an SCC unranked. Invariants only ever ADD
+     * premises, so any SCC that ranks without them needs none; computing them eagerly
+     * for the whole reachable graph is wasted work on the easy mass. Measured on a
+     * 277-proof whole-jar: the invariant fixpoint is the costliest engine tier
+     * (92.7 s, 32 %), yet skipping it changed not one of 693/83 verdicts — because the
+     * methods that need the premise are the rare ones, and lazy pays for them only
+     * there. Verdict-identical to the eager path by construction (a method that needs
+     * invariants still gets them on the retry). Off by default; the whole-jar verdict
+     * path opts in, the CPF/certify path stays eager so its certificate is byte-stable.
+     */
+    private static final boolean LAZY_INVARIANTS = Boolean.getBoolean("rati.lazyInvariants");
+
     private FarkasRanking() {}
 
     /**
@@ -305,40 +319,18 @@ public final class FarkasRanking {
         // a fact established before the loop, absent from the per-transition guards.
         // Invariants only ever ADD premises / seed candidates, so a failure to
         // compute them must degrade the proof search, not crash it.
-        Map<String, List<ItsLinearConstraint>> invariants;
-        if (INVARIANT_MAX_LOCS > 0 && reachable.size() > INVARIANT_MAX_LOCS) {
-            // Oversized reachable graph: the Apron fixpoint would grind (unbounded by
-            // the LP work budget). Skip it — sound, invariants only add premises.
-            if (DEBUG) System.err.println("[ranking] invariants skipped: reachable="
-                    + reachable.size() + " > " + INVARIANT_MAX_LOCS);
-            invariants = java.util.Collections.emptyMap();
-        } else {
-            long __ti = System.nanoTime();
-            try {
-                invariants = ItsInvariants.compute(its, entryLocation, reachable);
-            } catch (RuntimeException e) {
-                if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
-                invariants = java.util.Collections.emptyMap();
-            }
-            tier("invariants", reachable.size(), __ti);
-        }
-
-        // Second pruning pass, now that per-location invariants are known: drop cyclic
-        // transitions unreachable UNDER the source invariant (guard ∧ invariant empty),
-        // not just self-contradictory ones (line above). This removes the spurious
-        // divergent half a `!=`-guard split leaves behind — e.g. the `i >= n+1` branch
-        // of `i != n` under the loop invariant `i <= n`, or `x <= -1` of `x != 0` under
-        // `x >= 0`. Such a half fires from no reachable state, so dropping it is sound;
-        // keeping it forces an unrankable transition into the SCC, collapsing the cheap
-        // lexicographic round and pushing the proof into the costly disjunctive fallback
-        // (measured: Diff.dif 53s → 231s before this prune).
-        if (!invariants.isEmpty()) {
-            long __tp2 = System.nanoTime();
-            final Map<String, List<ItsLinearConstraint>> inv = invariants;
-            for (List<ItsTransition> ts : cyclic.values())
-                ts.removeIf(t -> ItsInvariants.isInfeasibleUnder(t, inv.get(t.source().name())));
-            nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
-            tier("eng-prune2", reachable.size(), __tp2);
+        //
+        // Under -Drati.lazyInvariants the fixpoint is deferred: a first ranking pass
+        // runs on the raw (only-infeasible-pruned) SCCs, and only an SCC left unranked
+        // there triggers the invariant computation + second prune + a retry (below,
+        // after the first pass). Eager mode keeps the original flow exactly.
+        final boolean lazy = LAZY_INVARIANTS;
+        Map<String, List<ItsLinearConstraint>> invariants = java.util.Collections.emptyMap();
+        boolean invariantsReady = false;
+        if (!lazy) {
+            invariants = computeInvariants(its, entryLocation, reachable);
+            invariantsReady = true;
+            pruneUnderInvariants(invariants, cyclic, nonTrivial, reachable);
             if (nonTrivial.isEmpty())
                 return new Certificate(unsupportedReachable ? Verdict.UNKNOWN : Verdict.TERMINATES, outProofs);
         }
@@ -392,6 +384,31 @@ public final class FarkasRanking {
             if (DEBUG) System.err.println("[ranking] buildWork=" + LinearProgram.buildSpent());
             if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
 
+            // Lazy invariants: the first pass (no premises) could not rank some SCC. Pay
+            // the deferred fixpoint now and retry exactly those SCCs under the invariants.
+            // An SCC already ranked above stays ranked (invariants only add premises), so
+            // only the unranked ones need a second look — and a method whose easy mass all
+            // ranked never reaches here. Verdict-identical to eager: the same invariants,
+            // the same second prune, the same rankScc — just confined to the residue.
+            if (lazy && !invariantsReady) {
+                invariants = computeInvariants(its, entryLocation, reachable);
+                invariantsReady = true;
+                if (!invariants.isEmpty()) {
+                    final Map<String, List<ItsLinearConstraint>> inv = invariants;
+                    List<List<ItsTransition>> stillUnranked = new ArrayList<List<ItsTransition>>();
+                    for (List<ItsTransition> sccTrans : unranked) {
+                        // Second prune on this SCC's own transitions (same objects), then re-rank.
+                        sccTrans.removeIf(t -> ItsInvariants.isInfeasibleUnder(t, inv.get(t.source().name())));
+                        if (sccTrans.isEmpty()) continue;   // pruned empty ⇒ trivially terminating
+                        if (unsupportedReachable
+                                || rankScc(its, invariants, sccTrans, proofs) != Verdict.TERMINATES)
+                            stillUnranked.add(sccTrans);
+                    }
+                    unranked = stillUnranked;
+                    if (unranked.isEmpty()) return new Certificate(Verdict.TERMINATES, outProofs);
+                }
+            }
+
             // When ranking fails we try to DISPROVE termination (recurrent-set search) before
             // returning UNKNOWN. A caller that only consumes TERMINATES (BCTerm's whole-jar
             // termination pass maps NONTERMINATES of the path-length ITS straight back to
@@ -418,6 +435,54 @@ public final class FarkasRanking {
     // -------------------------------------------------------------------------
     // Graph pre-processing
     // -------------------------------------------------------------------------
+
+    /**
+     * The supporting-invariant fixpoint, gated by {@link #INVARIANT_MAX_LOCS} and
+     * crash-proofed (a failed Apron run degrades to no premises, never a thrown proof).
+     * Shared verbatim by the eager and the lazy paths so the invariants — and the
+     * {@code [tier] invariants} timing — are identical whichever path computes them.
+     */
+    private static Map<String, List<ItsLinearConstraint>> computeInvariants(
+            IntegerTransitionSystem its, String entryLocation, Set<String> reachable) {
+        if (INVARIANT_MAX_LOCS > 0 && reachable.size() > INVARIANT_MAX_LOCS) {
+            // Oversized reachable graph: the Apron fixpoint would grind (unbounded by
+            // the LP work budget). Skip it — sound, invariants only add premises.
+            if (DEBUG) System.err.println("[ranking] invariants skipped: reachable="
+                    + reachable.size() + " > " + INVARIANT_MAX_LOCS);
+            return java.util.Collections.emptyMap();
+        }
+        long __ti = System.nanoTime();
+        try {
+            Map<String, List<ItsLinearConstraint>> inv =
+                    ItsInvariants.compute(its, entryLocation, reachable);
+            tier("invariants", reachable.size(), __ti);
+            return inv;
+        } catch (RuntimeException e) {
+            if (DEBUG) System.err.println("[ranking] invariants unavailable: " + e);
+            return java.util.Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Second pruning pass, now that per-location invariants are known: drop cyclic
+     * transitions unreachable UNDER the source invariant (guard ∧ invariant empty),
+     * not just self-contradictory ones. This removes the spurious divergent half a
+     * {@code !=}-guard split leaves behind — e.g. the {@code i >= n+1} branch of
+     * {@code i != n} under the loop invariant {@code i <= n}. Such a half fires from
+     * no reachable state, so dropping it is sound; keeping it forces an unrankable
+     * transition into the SCC, collapsing the cheap lexicographic round and pushing
+     * the proof into the costly disjunctive fallback (measured: Diff.dif 53s → 231s).
+     * Mutates {@code cyclic} (per-SCC transition lists) and {@code nonTrivial}.
+     */
+    private static void pruneUnderInvariants(Map<String, List<ItsLinearConstraint>> invariants,
+            Map<Integer, List<ItsTransition>> cyclic, Set<Integer> nonTrivial, Set<String> reachable) {
+        if (invariants.isEmpty()) return;
+        long __tp2 = System.nanoTime();
+        for (List<ItsTransition> ts : cyclic.values())
+            ts.removeIf(t -> ItsInvariants.isInfeasibleUnder(t, invariants.get(t.source().name())));
+        nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
+        tier("eng-prune2", reachable.size(), __tp2);
+    }
 
     private static Set<String> reachableFrom(IntegerTransitionSystem its, String entry) {
         Map<String, List<String>> succ = new HashMap<String, List<String>>();
