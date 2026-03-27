@@ -11,6 +11,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import fr.univreunion.rati.its.IntegerTransitionSystem;
 import fr.univreunion.rati.its.ItsLinearConstraint;
@@ -66,6 +68,95 @@ public final class FarkasRanking {
     private static void tier(String name, int sccSize, long t0) {
         if (TIER_TIMING) System.err.printf("[tier] %-26s scc=%-3d %6.0f ms%n",
                 name, sccSize, (System.nanoTime() - t0) / 1e6);
+    }
+
+    // SCC re-ranking forensics (default OFF, opt-in -Drati.sccRedundancy): measures the
+    // gain ceiling of a "rank-once-per-SCC" refactor by counting how many times each
+    // distinct program SCC is re-ranked across the per-method proof loop. A whole-jar run
+    // calls prove() once per (method × ranking tier), and each re-ranks every SCC reachable
+    // from the entry; the same program SCC (identified by its sorted location-name set —
+    // stable across entries since locations are program functors) is therefore ranked many
+    // times. We accumulate per fingerprint [count, totalNanos, firstNanos]: the total minus
+    // the first-occurrence time is exactly the wall a single global ranking would recover.
+    // A shutdown hook prints the aggregate. Read once at class-load.
+    private static final boolean SCC_REDUNDANCY = Boolean.getBoolean("rati.sccRedundancy");
+    // fingerprint -> [callCount, totalNanos, firstNanos]
+    private static final Map<String, long[]> SCC_STATS =
+            SCC_REDUNDANCY ? new ConcurrentHashMap<String, long[]>() : null;
+    private static final AtomicLong PROVE_CALLS = new AtomicLong();
+    private static final AtomicLong RANK_CALLS = new AtomicLong();
+    private static final AtomicLong SETUP_NANOS = new AtomicLong();   // per-method reachable+Tarjan+prune
+    static {
+        if (SCC_REDUNDANCY) Runtime.getRuntime().addShutdownHook(new Thread(FarkasRanking::dumpSccRedundancy));
+    }
+
+    // --- rank-once-per-SCC (the "Julia shape" cure for the O(methods) proof tax) ---
+    // The first ranking pass runs under EMPTY invariants, so an SCC's first-pass
+    // verdict (and its proof) is a pure function of the SCC's relational content,
+    // independent of which method entry re-reached it. Across the O(methods) prove()
+    // calls of a whole jar the same program SCC is ranked many times (measured: 7.1x
+    // on Kitten, 135s recoverable). We cache that entry-independent outcome by a
+    // content fingerprint and replay it. Only the lazy first pass (empty invariants)
+    // is cached; the entry-relative invariant retry stays per-method. Opt-in until the
+    // verdict + CPF byte-id gates prove it inert; default OFF.
+    private static final boolean RANK_ONCE = Boolean.getBoolean("rati.rankOnce");
+    private static final Map<String, CachedRank> RANK_CACHE =
+            RANK_ONCE ? new ConcurrentHashMap<String, CachedRank>() : null;
+
+    /** An SCC's entry-independent first-pass outcome: the verdict and (on success) its proof. */
+    private static final class CachedRank {
+        final Verdict verdict;
+        final SccProof proof;   // non-null iff verdict==TERMINATES and a certificate was collected
+        CachedRank(Verdict verdict, SccProof proof) { this.verdict = verdict; this.proof = proof; }
+    }
+
+    /**
+     * A content fingerprint of an SCC: the sorted multiset of its transitions'
+     * full relational renderings (source(vars) -> target(updates) {guards}). Two SCCs
+     * with this fingerprint rank identically under empty invariants, so a cached
+     * first-pass result is sound to replay across entries — and even across programs.
+     */
+    private static String sccFingerprint(List<ItsTransition> trans) {
+        List<String> reps = new ArrayList<String>(trans.size());
+        for (ItsTransition t : trans) reps.add(t.toString());
+        java.util.Collections.sort(reps);
+        return String.join("", reps);
+    }
+
+    /** Records one rankScc invocation under its SCC fingerprint (sorted location names). */
+    private static void recordScc(List<ItsTransition> cyclicTrans, long nanos) {
+        RANK_CALLS.incrementAndGet();
+        String key = String.join("|", sccLocations(cyclicTrans));
+        SCC_STATS.compute(key, (k, v) -> {
+            if (v == null) return new long[] { 1L, nanos, nanos };
+            v[0]++; v[1] += nanos; return v;                          // v[2] (first) stays
+        });
+    }
+
+    /** Prints the SCC re-ranking aggregate at JVM exit (gain ceiling of rank-once-per-SCC). */
+    private static void dumpSccRedundancy() {
+        long n = RANK_CALLS.get(), d = SCC_STATS.size();
+        long total = 0, first = 0;
+        for (long[] v : SCC_STATS.values()) { total += v[1]; first += v[2]; }
+        double recoverable = (total - first) / 1e9;
+        System.err.println("=== [sccRedundancy] gain-ceiling of rank-once-per-SCC ===");
+        System.err.printf("  prove() calls           : %d%n", PROVE_CALLS.get());
+        System.err.printf("  rankScc calls (N)        : %d%n", n);
+        System.err.printf("  distinct SCCs (D)        : %d%n", d);
+        System.err.printf("  re-rank ratio (N/D)      : %.1f x%n", d == 0 ? 0.0 : (double) n / d);
+        System.err.printf("  total ranking time       : %.1f s%n", total / 1e9);
+        System.err.printf("  first-occurrence time    : %.1f s  (irreducible, the one-pass keeps this)%n", first / 1e9);
+        System.err.printf("  RECOVERABLE (re-ranks)   : %.1f s  (%.0f%% of ranking)%n",
+                recoverable, total == 0 ? 0.0 : 100.0 * (total - first) / total);
+        System.err.printf("  per-method setup (reach+Tarjan), also redundant : %.1f s%n", SETUP_NANOS.get() / 1e9);
+        // Top SCCs by recoverable wall (count, total ms, recoverable ms).
+        System.err.println("  top SCCs by recoverable time:");
+        SCC_STATS.entrySet().stream()
+                .sorted((a, b) -> Long.compare(b.getValue()[1] - b.getValue()[2], a.getValue()[1] - a.getValue()[2]))
+                .limit(12)
+                .forEach(e -> System.err.printf("    x%-5d total=%8.1fms recov=%8.1fms  %s%n",
+                        e.getValue()[0], e.getValue()[1] / 1e6, (e.getValue()[1] - e.getValue()[2]) / 1e6,
+                        e.getKey().length() > 90 ? e.getKey().substring(0, 90) + "…" : e.getKey()));
     }
 
     /**
@@ -264,6 +355,7 @@ public final class FarkasRanking {
         List<SccProof> outProofs = proofs == null ? new ArrayList<SccProof>() : proofs;
         if (entryLocation == null || its.location(entryLocation) == null)
             return new Certificate(Verdict.UNKNOWN, outProofs);
+        if (SCC_REDUNDANCY) PROVE_CALLS.incrementAndGet();
 
         // Open a fresh exact-arithmetic work budget for this whole attempt: the LPs
         // below abort cumulatively once a pathological SCC's Farkas synthesis blows up,
@@ -298,6 +390,7 @@ public final class FarkasRanking {
         for (List<ItsTransition> ts : cyclic.values()) ts.removeIf(ItsInvariants::isInfeasible);
         nonTrivial.removeIf(c -> cyclic.get(c).isEmpty());
         tier("eng-setup", reachable.size(), __tsetup);
+        if (SCC_REDUNDANCY) SETUP_NANOS.addAndGet(System.nanoTime() - __tsetup);
 
         if (DEBUG) {
             int edges = 0;
@@ -582,6 +675,38 @@ public final class FarkasRanking {
     // -------------------------------------------------------------------------
 
     private static Verdict rankScc(IntegerTransitionSystem its,
+                                   Map<String, List<ItsLinearConstraint>> invariants,
+                                   List<ItsTransition> cyclicTrans, List<SccProof> proofs) {
+        // Rank-once: cache/replay the entry-independent first pass (empty invariants).
+        // The invariant retry passes a non-empty entry-relative map and is never cached.
+        if (RANK_ONCE && invariants.isEmpty()) {
+            String fp = sccFingerprint(cyclicTrans);
+            CachedRank hit = RANK_CACHE.get(fp);
+            if (hit != null) {
+                if (hit.verdict == Verdict.TERMINATES && proofs != null && hit.proof != null)
+                    proofs.add(hit.proof);
+                return hit.verdict;
+            }
+            Verdict v = timedRankScc(its, invariants, cyclicTrans, proofs);
+            // record() appends exactly one proof on TERMINATES; capture it for replay.
+            SccProof p = (v == Verdict.TERMINATES && proofs != null && !proofs.isEmpty())
+                    ? proofs.get(proofs.size() - 1) : null;
+            RANK_CACHE.put(fp, new CachedRank(v, p));
+            return v;
+        }
+        return timedRankScc(its, invariants, cyclicTrans, proofs);
+    }
+
+    private static Verdict timedRankScc(IntegerTransitionSystem its,
+                                   Map<String, List<ItsLinearConstraint>> invariants,
+                                   List<ItsTransition> cyclicTrans, List<SccProof> proofs) {
+        if (!SCC_REDUNDANCY) return rankSccImpl(its, invariants, cyclicTrans, proofs);
+        long __t0 = System.nanoTime();
+        try { return rankSccImpl(its, invariants, cyclicTrans, proofs); }
+        finally { recordScc(cyclicTrans, System.nanoTime() - __t0); }
+    }
+
+    private static Verdict rankSccImpl(IntegerTransitionSystem its,
                                    Map<String, List<ItsLinearConstraint>> invariants,
                                    List<ItsTransition> cyclicTrans, List<SccProof> proofs) {
         SccProof proof = proofs == null ? null : new SccProof(sccLocations(cyclicTrans));
