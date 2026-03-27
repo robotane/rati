@@ -356,7 +356,9 @@ public final class LinearProgram {
         for (int i = 0; i < m; i++) {
             Rational cb = c[basis[i]];
             if (cb.isZero()) continue;
-            for (int j = 0; j <= cols; j++) z[j] = z[j].add(cb.multiply(T[i][j]));
+            Rational[] row = T[i];
+            for (int j = 0; j <= cols; j++)
+                if (!row[j].isZero()) z[j] = z[j].add(cb.multiply(row[j]));   // cb·0 = 0: byte-id skip
         }
         return z;
     }
@@ -442,18 +444,30 @@ public final class LinearProgram {
     /** Gauss-Jordan pivot at {@code (pr,pc)}; updates basis and (if given) z-row. */
     private static void pivot(Rational[][] T, int[] basis, Rational[] z,
                               int m, int cols, int pr, int pc) {
-        Rational p = T[pr][pc];
-        for (int j = 0; j <= cols; j++) T[pr][j] = T[pr][j].divide(p);
+        // Sparse-aware exact pivot: the Farkas tableaux are wide but mostly zero, and
+        // f·0 = 0 (subtracting / dividing a zero is a no-op), so skipping zero entries
+        // of the pivot row is byte-identical to the dense update — same basis, same
+        // optimum, same certificate — while avoiding a bignum multiply+subtract per zero.
+        Rational[] prow = T[pr];
+        Rational p = prow[pc];
+        for (int j = 0; j <= cols; j++) if (!prow[j].isZero()) prow[j] = prow[j].divide(p);
         for (int i = 0; i < m; i++) {
             if (i == pr) continue;
             Rational f = T[i][pc];
             if (f.isZero()) continue;
-            for (int j = 0; j <= cols; j++) T[i][j] = T[i][j].subtract(f.multiply(T[pr][j]));
+            Rational[] row = T[i];
+            for (int j = 0; j <= cols; j++) {
+                Rational prj = prow[j];
+                if (!prj.isZero()) row[j] = row[j].subtract(f.multiply(prj));
+            }
         }
         if (z != null) {
             Rational f = z[pc];
             if (!f.isZero())
-                for (int j = 0; j <= cols; j++) z[j] = z[j].subtract(f.multiply(T[pr][j]));
+                for (int j = 0; j <= cols; j++) {
+                    Rational prj = prow[j];
+                    if (!prj.isZero()) z[j] = z[j].subtract(f.multiply(prj));
+                }
         }
         basis[pr] = pc;
     }
