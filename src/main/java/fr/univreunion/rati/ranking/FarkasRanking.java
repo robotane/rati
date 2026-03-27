@@ -950,9 +950,11 @@ public final class FarkasRanking {
         final IntegerTransitionSystem its;
         final Map<String, List<ItsLinearConstraint>> invariants;
         int next = 0;
-        // λ_{loc,i}: a free coefficient split into pos − neg parts (i = arity ⇒ constant).
-        final Map<String, int[]> lamPos = new HashMap<String, int[]>();
-        final Map<String, int[]> lamNeg = new HashMap<String, int[]>();
+        // λ_{loc,i}: a free (unrestricted-in-sign) coefficient, one LP column each
+        // (i = arity ⇒ the constant term). The column is declared free to the solver via
+        // LinearProgram#markFree, replacing the old pos − neg two-column split.
+        final Map<String, int[]> lam = new HashMap<String, int[]>();
+        final List<Integer> freeVars = new ArrayList<Integer>();
         final Map<ItsTransition, Integer> eps = new HashMap<ItsTransition, Integer>();
         final List<Map<Integer, Rational>> rows = new ArrayList<Map<Integer, Rational>>();
         final List<LinearProgram.Op> ops = new ArrayList<LinearProgram.Op>();
@@ -966,9 +968,9 @@ public final class FarkasRanking {
         void allocLambdas(List<String> locs) {
             for (String loc : locs) {
                 int arity = its.location(loc).arity();
-                int[] pos = new int[arity + 1], neg = new int[arity + 1];
-                for (int i = 0; i <= arity; i++) { pos[i] = next++; neg[i] = next++; }
-                lamPos.put(loc, pos); lamNeg.put(loc, neg);
+                int[] l = new int[arity + 1];
+                for (int i = 0; i <= arity; i++) { l[i] = next++; freeVars.add(l[i]); }
+                lam.put(loc, l);
             }
         }
 
@@ -981,11 +983,10 @@ public final class FarkasRanking {
             rows.add(r); ops.add(LinearProgram.Op.LE); rhs.add(Rational.ONE);
         }
 
-        /** Adds {@code coeff · λ_{loc,i}} into equation {@code eq} (pos − neg split). */
+        /** Adds {@code coeff · λ_{loc,i}} into equation {@code eq} (a single free column). */
         private void addLambda(Map<Integer, Rational> eq, String loc, int i, Rational coeff) {
             if (coeff.isZero()) return;
-            add(eq, lamPos.get(loc)[i], coeff);
-            add(eq, lamNeg.get(loc)[i], coeff.negate());
+            add(eq, lam.get(loc)[i], coeff);
         }
 
         private static void add(Map<Integer, Rational> eq, int var, Rational coeff) {
@@ -997,18 +998,18 @@ public final class FarkasRanking {
         /**
          * Renders the affine ranking function ρ synthesised for {@code loc} from an
          * LP solution: ρ = Σ_i λ_{loc,i}·formal_i + λ_{loc,arity}, where
-         * λ_{loc,i} = x[lamPos] − x[lamNeg] (the pos−neg split). For the certificate.
+         * λ_{loc,i} = x[lam[i]] (the native free coefficient). For the certificate.
          */
         String renderRho(String loc, Rational[] x, IntegerTransitionSystem its) {
             List<String> formals = its.location(loc).variables();
             int arity = formals.size();
-            int[] pos = lamPos.get(loc), neg = lamNeg.get(loc);
+            int[] l = lam.get(loc);
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < arity; i++) {
-                Rational c = x[pos[i]].subtract(x[neg[i]]);
+                Rational c = x[l[i]];
                 if (!c.isZero()) appendTerm(sb, c, formals.get(i));
             }
-            Rational k = x[pos[arity]].subtract(x[neg[arity]]);
+            Rational k = x[l[arity]];
             if (!k.isZero() || sb.length() == 0) appendTerm(sb, k, null);
             return sb.length() == 0 ? "0" : sb.toString();
         }
@@ -1026,10 +1027,10 @@ public final class FarkasRanking {
             BigInteger den = BigInteger.ONE;
             for (String loc : locs) {
                 int arity = its.location(loc).variables().size();
-                int[] pos = lamPos.get(loc), neg = lamNeg.get(loc);
+                int[] l = lam.get(loc);
                 Rational[] r = new Rational[arity + 1];
                 for (int i = 0; i <= arity; i++) {
-                    r[i] = x[pos[i]].subtract(x[neg[i]]);
+                    r[i] = x[l[i]];
                     BigInteger d = r[i].denominator();
                     den = den.divide(den.gcd(d)).multiply(d);     // lcm of all denominators
                 }
@@ -1059,9 +1060,9 @@ public final class FarkasRanking {
                 String loc = t.source().name();
                 List<String> formals = t.source().variables();
                 int arity = formals.size();
-                int[] pos = lamPos.get(loc), neg = lamNeg.get(loc);
+                int[] l = lam.get(loc);
                 Rational[] r = new Rational[arity + 1];
-                for (int i = 0; i <= arity; i++) r[i] = x[pos[i]].subtract(x[neg[i]]);
+                for (int i = 0; i <= arity; i++) r[i] = x[l[i]];
                 BigInteger den = BigInteger.ONE;
                 for (Rational q : r) {
                     BigInteger d = q.denominator();
@@ -1202,6 +1203,7 @@ public final class FarkasRanking {
 
         LinearProgram.Solution solveMaximisingStrictness(List<ItsTransition> active) {
             LinearProgram lp = new LinearProgram(next);
+            for (int v : freeVars) lp.markFree(v);   // λ coefficients are unrestricted in sign
             for (int r = 0; r < rows.size(); r++)
                 lp.addConstraint(dense(rows.get(r)), ops.get(r), rhs.get(r));
             Rational[] obj = new Rational[next];

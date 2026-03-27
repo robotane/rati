@@ -14,8 +14,17 @@ import java.util.List;
  * solution doubles as a Farkas/ranking certificate that must hold without
  * floating-point slack (see {@link FarkasRanking}).
  *
- * <p>Free variables (a template coefficient that may be negative) are handled by
- * the caller splitting them into a positive and a negative part, each {@code ≥ 0}.
+ * <p>Free variables (a template coefficient that may be negative) can be declared
+ * natively with {@link #markFree(int)}: a free variable is pre-pivoted into the
+ * basis and kept there ("free stays basic"), so it is never pinned non-basic at 0
+ * and never limits an entering column — the textbook treatment of an unrestricted
+ * variable. This replaces the caller-side pos/neg split (two {@code ≥ 0} columns per
+ * free coefficient) with a single column, halving the column count on the synthesiser's
+ * large Farkas LPs. The feasibility and the optimum are identical to the split form
+ * (a free variable spans the same value range either way); only the pivot trajectory —
+ * hence any byte-level certificate hash — differs. By default no variable is free, so
+ * a caller that does not call {@link #markFree} runs the original all-{@code ≥ 0} engine
+ * bit-for-bit.
  */
 public final class LinearProgram {
 
@@ -32,9 +41,22 @@ public final class LinearProgram {
     private final int numVars;
     private final List<Row> rows = new ArrayList<Row>();
     private Rational[] objective;   // maximise objective·x; null ⇒ pure feasibility
+    private final boolean[] free;   // free[j] ⇒ variable j is unrestricted in sign (default: none)
+    private boolean anyFree;        // true once any variable is marked free
 
     public LinearProgram(int numVars) {
         this.numVars = numVars;
+        this.free = new boolean[numVars];   // all false ⇒ every variable ≥ 0
+    }
+
+    /**
+     * Marks structural variable {@code j} as free (unrestricted in sign) — see the class
+     * doc. Idempotent. Must be called before {@link #solve()}; the choice does not affect
+     * the rows, only how the solver treats column {@code j}.
+     */
+    public void markFree(int j) {
+        if (j < 0 || j >= numVars) throw new IllegalArgumentException("free var index");
+        free[j] = true; anyFree = true;
     }
 
     /** Adds {@code coeffs·x  op  rhs}. {@code coeffs} length must be {@code numVars}. */
@@ -226,9 +248,14 @@ public final class LinearProgram {
     static long buildSpent() { return b().buildSpent; }
 
     public Solution solve() {
-        if (WORK_BUDGET <= 0) return USE_BAREISS ? solveFractionFree() : solveRational();
+        // The fraction-free (Bareiss) engine has no free-variable handling; when any
+        // variable is free, fall back to the rational engine (which does). Bareiss is an
+        // opt-in worst-case coefficient bound, not the measured default, so this only
+        // affects the rare -Drati.exactArith=bareiss + native-free combination.
+        boolean bareiss = USE_BAREISS && !anyFree;
+        if (WORK_BUDGET <= 0) return bareiss ? solveFractionFree() : solveRational();
         try {
-            return USE_BAREISS ? solveFractionFree() : solveRational();
+            return bareiss ? solveFractionFree() : solveRational();
         } catch (BudgetExceeded e) {
             return infeasible();
         }
@@ -310,12 +337,24 @@ public final class LinearProgram {
 
         boolean[] forbidden = new boolean[cols];   // columns barred from entering
 
+        // Column-indexed free flags (a free structural variable is unrestricted in sign;
+        // slacks/artificials never are). Null when nothing is free, which keeps the engine
+        // on its original all-≥0 path bit-for-bit. The initial basis (slacks/artificials =
+        // rhs ≥ 0, every structural at 0) is feasible even with free variables present —
+        // 0 is a valid value for a free variable — so no pre-pivot is needed; the free
+        // handling lives entirely in the entering/leaving rules of {@link #simplexFree}.
+        boolean[] colFree = null;
+        if (anyFree) {
+            colFree = new boolean[cols];
+            for (int j = 0; j < numVars; j++) colFree[j] = free[j];
+        }
+
         // ---- Phase 1: minimise Σ artificials  ⇔  maximise −Σ artificials ----
         if (nArt > 0) {
             Rational[] c1 = new Rational[cols];
             for (int j = 0; j < cols; j++) c1[j] = isArtificial[j] ? Rational.of(-1) : Rational.ZERO;
             Rational[] zrow = buildObjectiveRow(T, basis, c1, m, cols);
-            if (!simplex(T, basis, zrow, forbidden, m, cols)) return infeasible();
+            if (!simplex(T, basis, zrow, forbidden, colFree, m, cols)) return infeasible();
             if (zrow[cols].isNegative()) return infeasible();   // Σ artificials > 0
 
             // Drive any artificial still in the basis out (or accept a redundant row).
@@ -338,7 +377,7 @@ public final class LinearProgram {
         Rational[] c2 = new Rational[cols];
         for (int j = 0; j < cols; j++) c2[j] = j < numVars ? objective[j] : Rational.ZERO;
         Rational[] zrow = buildObjectiveRow(T, basis, c2, m, cols);
-        if (!simplex(T, basis, zrow, forbidden, m, cols)) {
+        if (!simplex(T, basis, zrow, forbidden, colFree, m, cols)) {
             // Unbounded: should not occur for our bounded ranking LPs. Treat as no useful optimum.
             return new Solution(true, extract(T, basis, m), null);
         }
@@ -388,12 +427,25 @@ public final class LinearProgram {
 
     /**
      * Runs simplex iterations (maximise) until optimal. Returns false if unbounded.
-     * Optimal when every non-forbidden reduced cost {@code z[j] ≥ 0}; the entering
-     * column is priced per {@link #PRICING_BLAND} (Dantzig with Bland fallback, or
-     * pure Bland), the leaving row by min-ratio with a smallest-basis-index tie-break.
+     * Dispatches on {@code colFree}: when it is null (no variable is free) the original
+     * all-{@code ≥0} engine {@link #simplexNonneg} runs unchanged (byte-identical); when
+     * some column is free, {@link #simplexFree} runs the signed-direction variant.
      */
     private static boolean simplex(Rational[][] T, int[] basis, Rational[] z,
-                                   boolean[] forbidden, int m, int cols) {
+                                   boolean[] forbidden, boolean[] colFree, int m, int cols) {
+        return colFree == null
+                ? simplexNonneg(T, basis, z, forbidden, m, cols)
+                : simplexFree(T, basis, z, forbidden, colFree, m, cols);
+    }
+
+    /**
+     * All-{@code ≥0} simplex (every variable non-negative). Optimal when every non-forbidden
+     * reduced cost {@code z[j] ≥ 0}; the entering column is priced per {@link #PRICING_BLAND}
+     * (Dantzig with Bland fallback, or pure Bland), the leaving row by min-ratio with a
+     * smallest-basis-index tie-break.
+     */
+    private static boolean simplexNonneg(Rational[][] T, int[] basis, Rational[] z,
+                                         boolean[] forbidden, int m, int cols) {
         boolean bland = PRICING_BLAND;     // pure-Bland mode never leaves Bland
         int stall = 0;
         // Flip to Bland for good after this many consecutive degenerate pivots —
@@ -434,6 +486,85 @@ public final class LinearProgram {
 
             // Anti-cycling: a long run of degenerate pivots (zero min-ratio ⇒ no
             // objective progress) flips pricing to Bland, which cannot cycle.
+            if (!bland) {
+                if (best.isZero()) { if (++stall > blandTrigger) bland = true; }
+                else stall = 0;
+            }
+        }
+    }
+
+    /**
+     * Simplex with free (unrestricted-in-sign) variables, flagged in {@code colFree}. It
+     * differs from {@link #simplexNonneg} in exactly two rules, the textbook treatment of an
+     * unrestricted variable:
+     * <ul>
+     *   <li><b>Entering</b> — a non-basic free variable sits at 0 (a feasible start) but is
+     *       eligible to enter whenever its reduced cost is <em>non-zero</em>, in either
+     *       direction: {@code z[j] < 0} ⇒ increase ({@code dir=+1}), {@code z[j] > 0} ⇒
+     *       decrease ({@code dir=-1}). A {@code ≥0} variable enters only on {@code z[j] < 0}
+     *       (increase), as before. Optimal ⇔ no eligible column remains.</li>
+     *   <li><b>Leaving</b> — the ratio test bounds how far the entering variable moves so that
+     *       every <em>non-free</em> basic variable stays {@code ≥0}; the limiting rows are
+     *       those with {@code dir·T[i][pc] > 0}. A free basic variable has no lower bound, so
+     *       its row never limits the move and it never leaves — once basic, it stays basic.</li>
+     * </ul>
+     * The Gauss-Jordan {@link #pivot} is direction-agnostic (for {@code dir=-1} the pivot is on
+     * a negative entry, which the exact-rational pivot handles), and the resulting basic value
+     * of a free variable may be negative — correct, and read straight out by {@link #extract}.
+     * Bland's rule (smallest eligible index in, smallest basis index out) still bounds the pivot
+     * count, so termination holds. Equivalent to the caller-side pos/neg split: same feasibility
+     * and same optimum, one column per free coefficient instead of two.
+     */
+    private static boolean simplexFree(Rational[][] T, int[] basis, Rational[] z,
+                                       boolean[] forbidden, boolean[] colFree, int m, int cols) {
+        boolean bland = PRICING_BLAND;
+        int stall = 0;
+        final int blandTrigger = 2 * (m + cols) + 64;
+        while (true) {
+            int pc = -1, dir = 0;
+            if (bland) {
+                for (int j = 0; j < cols; j++) {
+                    if (forbidden[j]) continue;
+                    if (colFree[j]) {
+                        if (!z[j].isZero()) { pc = j; dir = z[j].isNegative() ? 1 : -1; break; }
+                    } else if (z[j].isNegative()) { pc = j; dir = 1; break; }
+                }
+            } else {
+                // Dantzig: largest per-step objective gain |z[j]| among eligible columns.
+                Rational bestGain = null;
+                for (int j = 0; j < cols; j++) {
+                    if (forbidden[j]) continue;
+                    int d = 0;
+                    if (colFree[j]) { if (!z[j].isZero()) d = z[j].isNegative() ? 1 : -1; }
+                    else if (z[j].isNegative()) d = 1;
+                    if (d == 0) continue;
+                    Rational gain = d == 1 ? z[j].negate() : z[j];   // = |z[j]|
+                    if (bestGain == null || gain.compareTo(bestGain) > 0) {
+                        bestGain = gain; pc = j; dir = d;
+                    }
+                }
+            }
+            if (pc < 0) return true;                          // optimal
+
+            // Leaving row: keep every non-free basic var ≥ 0 as the entering var moves by
+            // t ≥ 0 in direction `dir`. Basic_i decreases at rate dir·T[i][pc]; rows where
+            // that rate is positive limit t. Free-basic rows are skipped (no lower bound).
+            int pr = -1;
+            Rational best = null;
+            for (int i = 0; i < m; i++) {
+                if (colFree[basis[i]]) continue;             // free basic var never leaves
+                Rational coef = dir == 1 ? T[i][pc] : T[i][pc].negate();
+                if (!coef.isPositive()) continue;
+                Rational ratio = T[i][cols].divide(coef);
+                if (best == null || ratio.compareTo(best) < 0
+                        || (ratio.compareTo(best) == 0 && basis[i] < basis[pr])) {
+                    best = ratio; pr = i;
+                }
+            }
+            if (pr < 0) return false;                         // unbounded
+            chargePivot(m, cols);
+            pivot(T, basis, z, m, cols, pr, pc);
+
             if (!bland) {
                 if (best.isZero()) { if (++stall > blandTrigger) bland = true; }
                 else stall = 0;
