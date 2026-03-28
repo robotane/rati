@@ -194,22 +194,24 @@ final class DisjunctiveTermination {
 
     /** LP: find f-coeffs c (length n+1) s.t. premises ⊨ f(i)≥0 and ⊨ f(i)−f(o)−1≥0. */
     private Rational[] solveFarkasLRF(List<Rational[]> prem) {
-        // Unknowns: c_0..c_n split into pos/neg (free), then per-implication μ's.
-        // Vars over Farkas universe V = {i_0..i_{n-1}, o_0..o_{n-1}} (2n) + const slot.
-        int cPos = 0, cNeg = (n + 1);
-        int base = 2 * (n + 1);
+        // Unknowns: c_0..c_n as native free (unrestricted-in-sign) columns, then
+        // per-implication μ's. Vars over Farkas universe V = {i_0..i_{n-1}, o_0..o_{n-1}}
+        // (2n) + const slot.
+        int c0 = 0;
+        int base = (n + 1);
         int p = prem.size();
         // implication A (bound): μ_a[0..p-1], μa0 ; implication B (decrease): μ_b[0..p-1], μb0
         int muA = base, muA0 = muA + p, muB = muA0 + 1, muB0 = muB + p;
         int total = muB0 + 1;
 
         LinearProgram lp = new LinearProgram(total);
+        for (int k = 0; k <= n; k++) lp.markFree(c0 + k);
         // ----- Bound implication: f(i) = Σ μa_l p_l + μa0  (identity over V and const) -----
         // variable i_k: coeff of f(i) is c_k ; coeff of o_k is 0.
         for (int k = 0; k < n; k++) {
             Rational[] row = new Rational[total];
             zero(row);
-            row[cPos + k] = Rational.ONE; row[cNeg + k] = Rational.of(-1);     // c_k
+            row[c0 + k] = Rational.ONE;     // c_k
             for (int l = 0; l < p; l++) row[muA + l] = prem.get(l)[k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
@@ -220,7 +222,7 @@ final class DisjunctiveTermination {
         }
         { // const slot: c_n = Σ μa_l const_l + μa0
             Rational[] row = new Rational[total]; zero(row);
-            row[cPos + n] = Rational.ONE; row[cNeg + n] = Rational.of(-1);
+            row[c0 + n] = Rational.ONE;
             for (int l = 0; l < p; l++) row[muA + l] = prem.get(l)[2 * n].negate();
             row[muA0] = Rational.of(-1);
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
@@ -228,13 +230,13 @@ final class DisjunctiveTermination {
         // ----- Decrease implication: f(i) − f(o) − 1 = Σ μb_l p_l + μb0 -----
         for (int k = 0; k < n; k++) {        // i_k : coeff c_k
             Rational[] row = new Rational[total]; zero(row);
-            row[cPos + k] = Rational.ONE; row[cNeg + k] = Rational.of(-1);
+            row[c0 + k] = Rational.ONE;
             for (int l = 0; l < p; l++) row[muB + l] = prem.get(l)[k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
         for (int k = 0; k < n; k++) {        // o_k : coeff −c_k
             Rational[] row = new Rational[total]; zero(row);
-            row[cPos + k] = Rational.of(-1); row[cNeg + k] = Rational.ONE;
+            row[c0 + k] = Rational.of(-1);
             for (int l = 0; l < p; l++) row[muB + l] = prem.get(l)[n + k].negate();
             lp.addConstraint(row, LinearProgram.Op.EQ, Rational.ZERO);
         }
@@ -247,7 +249,7 @@ final class DisjunctiveTermination {
         LinearProgram.Solution sol = lp.solve();
         if (!sol.feasible) return null;
         Rational[] c = new Rational[n + 1];
-        for (int k = 0; k <= n; k++) c[k] = sol.x[cPos + k].subtract(sol.x[cNeg + k]);
+        for (int k = 0; k <= n; k++) c[k] = sol.x[c0 + k];
         return c;
     }
 

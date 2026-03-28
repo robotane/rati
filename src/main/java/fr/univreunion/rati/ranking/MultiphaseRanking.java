@@ -95,10 +95,11 @@ final class MultiphaseRanking {
         final Map<String, List<ItsLinearConstraint>> invariants;
         final int d;
         int next = 0;
-        // λ_{i,loc}: free coefficients of phase i's template at a location, split pos − neg
-        // (index arity ⇒ the constant term). Keyed "i|loc".
-        final Map<String, int[]> lamPos = new HashMap<String, int[]>();
-        final Map<String, int[]> lamNeg = new HashMap<String, int[]>();
+        // λ_{i,loc}: free (unrestricted-in-sign) coefficients of phase i's template at a
+        // location (index arity ⇒ the constant term). Keyed "i|loc". Declared as native
+        // free LP columns (markFree) rather than a pos − neg split.
+        final Map<String, int[]> lam = new HashMap<String, int[]>();
+        final List<Integer> freeVars = new ArrayList<Integer>();
         final Map<String, Integer> arity = new HashMap<String, Integer>();
         final List<Map<Integer, Rational>> rows = new ArrayList<Map<Integer, Rational>>();
         final List<LinearProgram.Op> ops = new ArrayList<LinearProgram.Op>();
@@ -136,6 +137,7 @@ final class MultiphaseRanking {
                 implication(t, e, Rational.ZERO);
             }
             LinearProgram lp = new LinearProgram(next);
+            for (int v : freeVars) lp.markFree(v);
             for (int r = 0; r < rows.size(); r++) lp.addConstraint(dense(rows.get(r)), ops.get(r), rhs.get(r));
             return lp;
         }
@@ -166,11 +168,11 @@ final class MultiphaseRanking {
             Map<String, Rational[]> raw = new java.util.LinkedHashMap<String, Rational[]>();
             java.math.BigInteger den = java.math.BigInteger.ONE;
             for (String loc : locs) {
-                int[] pos = lamPos.get(i + "|" + loc), neg = lamNeg.get(i + "|" + loc);
-                if (pos == null) continue;
-                Rational[] r = new Rational[pos.length];
-                for (int k = 0; k < pos.length; k++) {
-                    r[k] = x[pos[k]].subtract(x[neg[k]]);
+                int[] l = lam.get(i + "|" + loc);
+                if (l == null) continue;
+                Rational[] r = new Rational[l.length];
+                for (int k = 0; k < l.length; k++) {
+                    r[k] = x[l[k]];
                     java.math.BigInteger dn = r[k].denominator();
                     den = den.divide(den.gcd(dn)).multiply(dn);   // lcm of all denominators
                 }
@@ -189,10 +191,10 @@ final class MultiphaseRanking {
 
         private void allocLambda(int i, String loc, int ar) {
             String key = i + "|" + loc;
-            if (lamPos.containsKey(key)) return;
-            int[] pos = new int[ar + 1], neg = new int[ar + 1];
-            for (int k = 0; k <= ar; k++) { pos[k] = next++; neg[k] = next++; }
-            lamPos.put(key, pos); lamNeg.put(key, neg);
+            if (lam.containsKey(key)) return;
+            int[] l = new int[ar + 1];
+            for (int k = 0; k <= ar; k++) { l[k] = next++; freeVars.add(l[k]); }
+            lam.put(key, l);
         }
 
         /** A signed reference to a phase function evaluated at a transition endpoint. */
@@ -257,9 +259,7 @@ final class MultiphaseRanking {
 
         private void addLambda(Map<Integer, Rational> eq, int phase, String loc, int k, Rational coeff) {
             if (coeff.isZero()) return;
-            String key = phase + "|" + loc;
-            add(eq, lamPos.get(key)[k], coeff);
-            add(eq, lamNeg.get(key)[k], coeff.negate());
+            add(eq, lam.get(phase + "|" + loc)[k], coeff);
         }
 
         private static void add(Map<Integer, Rational> eq, int var, Rational c) {

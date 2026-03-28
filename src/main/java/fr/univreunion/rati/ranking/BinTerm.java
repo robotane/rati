@@ -308,17 +308,18 @@ public final class BinTerm {
         int n = formals.size();
         int nP = prem.size();
 
-        // Unknown layout (all LP variables are ≥ 0):
-        //   ap[v], an[v]   : aᵥ = ap−an              (free, split)
-        //   ap0, an0       : a₀ = ap0−an0            (free, split)
-        //   lamD[i], lam0D : decrease certificate    (≥ 0)
-        //   lamB[i], lam0B : boundedness certificate (≥ 0)
-        int AP = 0, AN = n, AP0 = 2 * n, AN0 = 2 * n + 1;
-        int LAMD = 2 * n + 2, LAM0D = LAMD + nP;
+        // Unknown layout:
+        //   a[v]           : aᵥ                       (native free)
+        //   a0             : a₀                       (native free)
+        //   lamD[i], lam0D : decrease certificate     (≥ 0)
+        //   lamB[i], lam0B : boundedness certificate  (≥ 0)
+        int A = 0, A0 = n;
+        int LAMD = n + 1, LAM0D = LAMD + nP;
         int LAMB = LAM0D + 1, LAM0B = LAMB + nP;
         int numVars = LAM0B + 1;
 
         LinearProgram lp = new LinearProgram(numVars);
+        for (int vi = 0; vi <= n; vi++) lp.markFree(A + vi);   // a_v and a_0 unrestricted
 
         for (int target = 0; target < 2; target++) {           // 0 = decrease, 1 = boundedness
             boolean decrease = target == 0;
@@ -328,8 +329,7 @@ public final class BinTerm {
             // Monomial I@v: coeff of f(I)−f(C)−1 is aᵥ (decrease) / coeff of f(I) is aᵥ.
             for (int vi = 0; vi < n; vi++) {
                 Rational[] row = zeros(numVars);
-                row[AP + vi] = Rational.ONE;
-                row[AN + vi] = NEG_ONE;
+                row[A + vi] = Rational.ONE;
                 String iv = "I@" + formals.get(vi);
                 for (int i = 0; i < nP; i++)
                     addCoeff(row, lam + i, -prem.get(i).coefficient(iv));
@@ -338,7 +338,7 @@ public final class BinTerm {
             // Monomial C@v: coeff is −aᵥ (decrease) / 0 (boundedness).
             for (int vi = 0; vi < n; vi++) {
                 Rational[] row = zeros(numVars);
-                if (decrease) { row[AP + vi] = NEG_ONE; row[AN + vi] = Rational.ONE; }
+                if (decrease) row[A + vi] = NEG_ONE;
                 String cv = "C@" + formals.get(vi);
                 for (int i = 0; i < nP; i++)
                     addCoeff(row, lam + i, -prem.get(i).coefficient(cv));
@@ -351,7 +351,7 @@ public final class BinTerm {
             if (decrease) {
                 rhs = Rational.ONE;
             } else {
-                row[AP0] = Rational.ONE; row[AN0] = NEG_ONE;
+                row[A0] = Rational.ONE;
                 rhs = Rational.ZERO;
             }
             for (int i = 0; i < nP; i++)
@@ -363,8 +363,8 @@ public final class BinTerm {
         LinearProgram.Solution s = lp.solve();
         if (!s.feasible) return null;
         Rational[] a = new Rational[n];
-        for (int vi = 0; vi < n; vi++) a[vi] = s.x[AP + vi].subtract(s.x[AN + vi]);
-        Rational a0 = s.x[AP0].subtract(s.x[AN0]);
+        for (int vi = 0; vi < n; vi++) a[vi] = s.x[A + vi];
+        Rational a0 = s.x[A0];
         return new AffineRank(formals, a, a0);
     }
 
