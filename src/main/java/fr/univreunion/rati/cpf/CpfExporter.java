@@ -75,7 +75,7 @@ public final class CpfExporter {
 
     /** Convenience: prove with a certificate and export in one step. */
     public static String proveAndExport(IntegerTransitionSystem its, String entry) {
-        return export(its, entry, FarkasRanking.proveWithCertificate(its, entry));
+        return export(its, entry, FarkasRanking.proveWithCertificate(its, entry, true));
     }
 
     // -- per-export state ----------------------------------------------------

@@ -97,9 +97,14 @@ public final class FarkasRanking {
     // calls of a whole jar the same program SCC is ranked many times (measured: 7.1x
     // on Kitten, 135s recoverable). We cache that entry-independent outcome by a
     // content fingerprint and replay it. Only the lazy first pass (empty invariants)
-    // is cached; the entry-relative invariant retry stays per-method. Opt-in until the
-    // verdict + CPF byte-id gates prove it inert; default OFF.
-    private static final boolean RANK_ONCE = Boolean.getBoolean("rati.rankOnce");
+    // is cached; the entry-relative invariant retry stays per-method. Verdict-inert
+    // (Kitten 693/83 byte-id, tpdb_julia09 0-divergence). The cache keys on the
+    // empty-invariant first pass, so it is consulted only when invariants.isEmpty();
+    // the CPF/certify path runs forceEager (non-empty invariants) and so bypasses the
+    // cache entirely, keeping the exported proof the fresh, emittable one. On by
+    // default; disable with -Drati.rankOnce=false.
+    private static final boolean RANK_ONCE =
+            Boolean.parseBoolean(System.getProperty("rati.rankOnce", "true"));
     private static final Map<String, CachedRank> RANK_CACHE =
             RANK_ONCE ? new ConcurrentHashMap<String, CachedRank>() : null;
 
@@ -231,10 +236,14 @@ public final class FarkasRanking {
      * (92.7 s, 32 %), yet skipping it changed not one of 693/83 verdicts — because the
      * methods that need the premise are the rare ones, and lazy pays for them only
      * there. Verdict-identical to the eager path by construction (a method that needs
-     * invariants still gets them on the retry). Off by default; the whole-jar verdict
-     * path opts in, the CPF/certify path stays eager so its certificate is byte-stable.
+     * invariants still gets them on the retry). On by default; the CPF/certify path
+     * passes {@code forceEager} to {@link #proveWithCertificate(IntegerTransitionSystem,
+     * String, boolean)}, so an exported proof always reaches the emittable DIRECT
+     * multiphase synthesis (a lazy first pass can settle for the non-exportable
+     * loop-summary MΦRF fallback). Disable with -Drati.lazyInvariants=false.
      */
-    private static final boolean LAZY_INVARIANTS = Boolean.getBoolean("rati.lazyInvariants");
+    private static final boolean LAZY_INVARIANTS =
+            Boolean.parseBoolean(System.getProperty("rati.lazyInvariants", "true"));
 
     private FarkasRanking() {}
 
@@ -321,11 +330,25 @@ public final class FarkasRanking {
 
     /** Proves termination or non-termination AND collects a {@link Certificate}. */
     public static Certificate proveWithCertificate(IntegerTransitionSystem its, String entryLocation) {
-        return prove(its, entryLocation, new ArrayList<SccProof>());
+        return proveWithCertificate(its, entryLocation, false);
+    }
+
+    /**
+     * Proves and collects a {@link Certificate}, optionally forcing eager invariants.
+     * The CPF-export path passes {@code forceEager=true}: a lazily-found proof can rank
+     * an SCC through the non-emittable loop-summary MΦRF fallback (sound, but its merged
+     * transitions are not exportable, so {@code SccProof.multiphase} is left unattached
+     * and the exporter declines). Computing invariants up front lets the DIRECT, emittable
+     * multiphase synthesis succeed, so the certificate exports. The verdict path keeps
+     * lazy (the whole-jar speed win), since it never exports.
+     */
+    public static Certificate proveWithCertificate(IntegerTransitionSystem its, String entryLocation,
+            boolean forceEager) {
+        return prove(its, entryLocation, new ArrayList<SccProof>(), forceEager);
     }
 
     public static Verdict prove(IntegerTransitionSystem its, String entryLocation) {
-        return prove(its, entryLocation, null).verdict;
+        return prove(its, entryLocation, null, false).verdict;
     }
 
     /**
@@ -351,7 +374,7 @@ public final class FarkasRanking {
     }
 
     private static Certificate prove(IntegerTransitionSystem its, String entryLocation,
-            List<SccProof> proofs) {
+            List<SccProof> proofs, boolean forceEager) {
         List<SccProof> outProofs = proofs == null ? new ArrayList<SccProof>() : proofs;
         if (entryLocation == null || its.location(entryLocation) == null)
             return new Certificate(Verdict.UNKNOWN, outProofs);
@@ -417,7 +440,7 @@ public final class FarkasRanking {
         // runs on the raw (only-infeasible-pruned) SCCs, and only an SCC left unranked
         // there triggers the invariant computation + second prune + a retry (below,
         // after the first pass). Eager mode keeps the original flow exactly.
-        final boolean lazy = LAZY_INVARIANTS;
+        final boolean lazy = LAZY_INVARIANTS && !forceEager;
         Map<String, List<ItsLinearConstraint>> invariants = java.util.Collections.emptyMap();
         boolean invariantsReady = false;
         if (!lazy) {

@@ -280,7 +280,10 @@ public final class RankMain {
         long proveT0 = System.nanoTime();
         FarkasRanking.Certificate cert;
         try {
-            cert = FarkasRanking.proveWithCertificate(its, start);
+            // Force eager invariants when a CPF will be written, so the proof reaches the
+            // emittable DIRECT multiphase synthesis (a lazy pass can settle for the
+            // non-exportable loop-summary fallback). A plain verdict run keeps lazy.
+            cert = FarkasRanking.proveWithCertificate(its, start, cpfOut != null);
         } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
             // Apron's native library could not be loaded — a configuration error, not
             // an analysis outcome. RuntimeException's catch would miss it (it is an
