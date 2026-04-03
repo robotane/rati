@@ -85,6 +85,24 @@ public final class ItsInvariants {
 
     private ItsInvariants() {}
 
+    /**
+     * Frees the superseded intermediate {@code old} on THIS (the proof) thread and returns
+     * its replacement {@code neo}. The chained Apron transfers below ({@code meetCopy},
+     * {@code changeEnvironmentCopy}, {@code joinCopy}, …) each allocate a fresh native
+     * polyhedron and leave the previous one dead; left to the GC they are freed later by the
+     * JVM {@code Cleaner} daemon, which calls into the per-thread {@code Polka} manager
+     * asynchronously — and NewPolka is "not safe under concurrent operations" (see
+     * {@link ApronManagers}), so a free racing a proof still mid-operation on the same
+     * manager can corrupt native state. Disposing each dead intermediate synchronously, on
+     * the proof thread, keeps it off the Cleaner's queue (deterministic same-thread free,
+     * race-free) and bounds the live native footprint to the few polyhedra actually in
+     * flight. Only ever applied to locals that neither escape nor alias a still-live value.
+     */
+    private static Abstract1 supersede(Abstract1 old, Abstract1 neo) {
+        if (old != null) old.dispose();
+        return neo;
+    }
+
     /** Computes a per-location invariant (over each location's formals) for the reachable sub-ITS. */
     public static Map<String, List<ItsLinearConstraint>> compute(
             IntegerTransitionSystem its, String entry, Set<String> reachable) {
@@ -108,8 +126,10 @@ public final class ItsInvariants {
             Abstract1 a = new Abstract1(man, env);   // ⊤
             List<Lincons1> cons = new ArrayList<Lincons1>();
             for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(env, c));
-            if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
-            return a.isBottom(man);
+            if (!cons.isEmpty()) a = supersede(a, a.meetCopy(man, cons.toArray(new Lincons1[0])));
+            boolean bot = a.isBottom(man);
+            a.dispose();
+            return bot;
         } catch (ApronException e) {
             return false;   // undecided ⇒ keep the transition (sound)
         }
@@ -144,8 +164,10 @@ public final class ItsInvariants {
             List<Lincons1> cons = new ArrayList<Lincons1>();
             for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(env, c));
             for (ItsLinearConstraint c : srcInvariant) cons.add(ApronBridge.toLincons(env, c));
-            if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
-            return a.isBottom(man);
+            if (!cons.isEmpty()) a = supersede(a, a.meetCopy(man, cons.toArray(new Lincons1[0])));
+            boolean bot = a.isBottom(man);
+            a.dispose();
+            return bot;
         } catch (ApronException e) {
             return false;   // undecided ⇒ keep the transition (sound)
         }
@@ -173,7 +195,7 @@ public final class ItsInvariants {
             List<Lincons1> cons = new ArrayList<Lincons1>();
             if (premises != null)
                 for (ItsLinearExpression p : premises) cons.add(ApronBridge.geLincons(env, p));
-            if (!cons.isEmpty()) a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
+            if (!cons.isEmpty()) a = supersede(a, a.meetCopy(man, cons.toArray(new Lincons1[0])));
             // Meet with ρ ≤ −1, encoded as −ρ − 1 ≥ 0 (Apron SUPEQ). The non-strict
             // form is exact over integers — ρ here is integer-scaled, so ρ ≥ 0 over
             // ℤ iff no integer point has ρ ≤ −1 — and, unlike a strict SUP, is not
@@ -185,8 +207,10 @@ public final class ItsInvariants {
                 neg.put(e.getKey(), BigInteger.valueOf(e.getValue()).negate());
             Linexpr1 le = ApronBridge.linexpr(env, neg,
                     BigInteger.valueOf(rhoConst).negate().subtract(BigInteger.ONE));
-            a = a.meetCopy(man, new Lincons1(Lincons1.SUPEQ, le));
-            return a.isBottom(man);
+            a = supersede(a, a.meetCopy(man, new Lincons1(Lincons1.SUPEQ, le)));
+            boolean bot = a.isBottom(man);
+            a.dispose();
+            return bot;
         } catch (ApronException e) {
             return false;   // could not prove ρ ≥ 0 ⇒ do not peel (sound)
         }
@@ -207,7 +231,8 @@ public final class ItsInvariants {
             Map<String, Abstract1> inv = new HashMap<String, Abstract1>();
             for (String loc : reachable)
                 inv.put(loc, new Abstract1(man, envOf(its.location(loc)), true));   // ⊥
-            inv.put(entry, new Abstract1(man, envOf(its.location(entry))));          // ⊤
+            Abstract1 entryBot = inv.put(entry, new Abstract1(man, envOf(its.location(entry))));  // ⊤ over ⊥
+            if (entryBot != null) entryBot.dispose();   // the entry's discarded ⊥
 
             Map<String, Integer> visits = new HashMap<String, Integer>();
             Deque<String> work = new ArrayDeque<String>();
@@ -225,12 +250,15 @@ public final class ItsInvariants {
                     Abstract1 post = postImage(src, t);
                     Abstract1 old = inv.get(tgt);
                     Abstract1 joined = old.joinCopy(man, post);
+                    post.dispose();   // consumed by the join — dead, never aliased
                     int v = visits.getOrDefault(tgt, 0) + 1;
                     visits.put(tgt, v);
-                    if (v > WIDEN_DELAY) joined = old.widening(man, joined);
-                    if (!joined.isIncluded(man, old)) {   // grew ⇒ propagate
+                    if (v > WIDEN_DELAY) joined = supersede(joined, old.widening(man, joined));
+                    if (!joined.isIncluded(man, old)) {   // grew ⇒ propagate (joined escapes into inv)
                         inv.put(tgt, joined);
                         if (inWork.add(tgt)) work.add(tgt);
+                    } else {
+                        joined.dispose();   // not propagated — dead
                     }
                 }
             }
@@ -243,6 +271,10 @@ public final class ItsInvariants {
             // Exact read-back; a conjunct beyond the long model is dropped, which
             // only weakens the invariant — the sound direction for a premise.
             for (String loc : reachable) out.put(loc, ApronBridge.toConstraints(man, inv.get(loc)));
+            // The fixpoint is now read back into ItsLinearConstraints (pure Java); free the
+            // surviving native polyhedra here, on the proof thread, instead of leaving the whole
+            // map to the Cleaner daemon (each loc holds its own object — no cross-key aliasing).
+            for (Abstract1 v : inv.values()) if (v != null) v.dispose();
         } catch (ApronException e) {
             throw new RuntimeException(e);
         }
@@ -268,13 +300,21 @@ public final class ItsInvariants {
                 List<ItsTransition> incoming = byTarget.getOrDefault(loc, java.util.Collections.emptyList());
                 Abstract1 acc = new Abstract1(man, envOf(its.location(loc)), true);  // ⊥
                 for (ItsTransition t : incoming) {
-                    Abstract1 srcInv = inv.get(t.source().name());
+                    Abstract1 srcInv = inv.get(t.source().name());   // live map value — never disposed
                     if (srcInv.isBottom(man)) continue;
-                    acc = acc.joinCopy(man, postImage(srcInv, t));
+                    Abstract1 pi = postImage(srcInv, t);
+                    Abstract1 nacc = acc.joinCopy(man, pi);
+                    pi.dispose();                 // postImage result, consumed by the join — dead
+                    acc = supersede(acc, nacc);   // previous acc (⊥ or prior join) — dead, never aliased
                 }
                 // Sound only as a tightening: keep within the current (post-fixpoint) value.
-                Abstract1 cur = inv.get(loc);
-                next.put(loc, acc.isIncluded(man, cur) ? acc : cur);
+                Abstract1 cur = inv.get(loc);     // live map value — never disposed
+                if (acc.isIncluded(man, cur)) {
+                    next.put(loc, acc);           // acc escapes into next/inv
+                } else {
+                    next.put(loc, cur);           // keep the tighter current value
+                    acc.dispose();                // acc discarded — dead
+                }
             }
             inv.putAll(next);
         }
@@ -301,22 +341,24 @@ public final class ItsInvariants {
             throw new RuntimeException("invariant op budget exhausted at " + invOpSpent);
 
         Environment full = new Environment(new String[0], names.toArray(new String[0]));
+        // src is the caller's live invariant — never disposed; every a_i below is a fresh
+        // copy, dead the moment the next transfer supersedes it (see supersede()).
         Abstract1 a = src.changeEnvironmentCopy(man, full, false);
 
         List<Lincons1> cons = new ArrayList<Lincons1>();
         for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(full, c));
         for (int j = 0; j < res.length; j++)
             cons.add(ApronBridge.bindEq(full, res[j], t.updates().get(j)));
-        a = a.meetCopy(man, cons.toArray(new Lincons1[0]));
+        a = supersede(a, a.meetCopy(man, cons.toArray(new Lincons1[0])));
 
         // Project onto the result vars, then rename them to the target formals.
         Environment resEnv = new Environment(new String[0], res.clone());
-        a = a.changeEnvironmentCopy(man, resEnv, true);
-        if (res.length > 0) a = a.renameCopy(man, res.clone(), tv.toArray(new String[0]));
+        a = supersede(a, a.changeEnvironmentCopy(man, resEnv, true));
+        if (res.length > 0) a = supersede(a, a.renameCopy(man, res.clone(), tv.toArray(new String[0])));
 
         // Normalise to exactly the target-formal environment.
         Environment tgtEnv = new Environment(new String[0], tv.toArray(new String[0]));
-        return a.changeEnvironmentCopy(man, tgtEnv, false);
+        return supersede(a, a.changeEnvironmentCopy(man, tgtEnv, false));
     }
 
     private static Environment envOf(ItsLocation loc) {
