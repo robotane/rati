@@ -79,37 +79,46 @@ final class DisjunctiveTermination {
 
     private boolean run(List<ItsTransition> selfLoops) throws ApronException {
         List<Abstract1> T = new ArrayList<Abstract1>();       // the transitions, as relations
-        for (ItsTransition t : selfLoops) T.add(relationOf(t));
-
-        boolean dbg = Boolean.getBoolean("rati.rankingDebug");
-        // Seed: a well-founded relation ranking each individual transition.
         List<Abstract1> R = new ArrayList<Abstract1>();
-        for (Abstract1 t : T) {
-            Abstract1 wf = rankRelation(t);
-            if (dbg) System.err.println("  [disjunctive] seed ranked=" + (wf != null)
-                    + (wf == null ? "  rel=" + java.util.Arrays.toString(t.toLincons(man)) : ""));
-            if (wf == null) return false;                     // a transition with no LRF — give up (sound)
-            R.add(wf);
-        }
-        // (1) T ⊆ ⋃R holds by construction. Grow R until (2) ⋃R ∘ T ⊆ ⋃R (inductive).
-        for (int iter = 0; iter < MAX_RELATIONS; iter++) {
-            Abstract1 escaping = null;
-            for (Abstract1 r : R) {
-                for (Abstract1 t : T) {
-                    Abstract1 comp = compose(r, t);
-                    if (comp.isBottom(man)) continue;
-                    Abstract1 esc = notCovered(comp, R);      // comp minus ⋃R, as a witness region
-                    if (esc != null && !esc.isBottom(man)) { escaping = esc; break; }
-                }
-                if (escaping != null) break;
+        // Nothing built here escapes run() (it returns a boolean); free T and R — the two
+        // persistent relation lists — on the proof thread on every exit, off the Cleaner queue.
+        // The per-iteration comp/escaping witnesses that are neither ranked into R nor kept are
+        // the small residual left to the GC.
+        try {
+            for (ItsTransition t : selfLoops) T.add(relationOf(t));
+
+            boolean dbg = Boolean.getBoolean("rati.rankingDebug");
+            // Seed: a well-founded relation ranking each individual transition.
+            for (Abstract1 t : T) {
+                Abstract1 wf = rankRelation(t);
+                if (dbg) System.err.println("  [disjunctive] seed ranked=" + (wf != null)
+                        + (wf == null ? "  rel=" + java.util.Arrays.toString(t.toLincons(man)) : ""));
+                if (wf == null) return false;                     // a transition with no LRF — give up (sound)
+                R.add(wf);
             }
-            if (escaping == null) return true;                // inductive ⇒ T⁺ ⊆ ⋃R ⇒ terminates
-            Abstract1 wf = rankRelation(escaping);
-            if (dbg) System.err.println("  [disjunctive] iter " + iter + ": escaping region, ranked=" + (wf != null));
-            if (wf == null) return false;                     // escaping part not rankable — give up
-            R.add(wf);
+            // (1) T ⊆ ⋃R holds by construction. Grow R until (2) ⋃R ∘ T ⊆ ⋃R (inductive).
+            for (int iter = 0; iter < MAX_RELATIONS; iter++) {
+                Abstract1 escaping = null;
+                for (Abstract1 r : R) {
+                    for (Abstract1 t : T) {
+                        Abstract1 comp = compose(r, t);
+                        if (comp.isBottom(man)) { comp.dispose(); continue; }
+                        Abstract1 esc = notCovered(comp, R);      // comp minus ⋃R, as a witness region
+                        if (esc != null && !esc.isBottom(man)) { escaping = esc; break; }
+                    }
+                    if (escaping != null) break;
+                }
+                if (escaping == null) return true;                // inductive ⇒ T⁺ ⊆ ⋃R ⇒ terminates
+                Abstract1 wf = rankRelation(escaping);
+                if (dbg) System.err.println("  [disjunctive] iter " + iter + ": escaping region, ranked=" + (wf != null));
+                if (wf == null) return false;                     // escaping part not rankable — give up
+                R.add(wf);
+            }
+            return false;                                          // did not converge within the cap
+        } finally {
+            for (Abstract1 x : T) if (x != null) x.dispose();
+            for (Abstract1 x : R) if (x != null) x.dispose();
         }
-        return false;                                          // did not converge within the cap
     }
 
     // -------------------------------------------------------------------------
@@ -131,30 +140,36 @@ final class DisjunctiveTermination {
         List<Lincons1> cs = new ArrayList<Lincons1>();
         for (ItsLinearConstraint c : t.constraints()) cs.add(ApronBridge.toLincons(env, c));
         for (int k = 0; k < n; k++) cs.add(ApronBridge.bindEq(env, o[k], t.updates().get(k)));
-        Abstract1 a = new Abstract1(man, env).meetCopy(man, cs.toArray(new Lincons1[0]));
+        Abstract1 seed = new Abstract1(man, env);
+        Abstract1 a = seed.meetCopy(man, cs.toArray(new Lincons1[0]));
+        seed.dispose();   // ⊤ seed superseded by the meet — dead
 
         String[] keep = new String[2 * n];
         for (int k = 0; k < n; k++) { keep[k] = src.get(k); keep[n + k] = o[k]; }
-        a = a.changeEnvironmentCopy(man, new Environment(new String[0], keep), true);
+        a = ApronBridge.supersede(a, a.changeEnvironmentCopy(man, new Environment(new String[0], keep), true));
         String[] from = new String[n], to = new String[n];
         for (int k = 0; k < n; k++) { from[k] = src.get(k); to[k] = IN + k; }
-        return a.renameCopy(man, from, to);
+        return ApronBridge.supersede(a, a.renameCopy(man, from, to));   // renamed copy escapes (into T)
     }
 
     /** Relational composition {@code r ∘ t} = {(i,o): ∃m. (i,m)∈r ∧ (m,o)∈t}. */
     private Abstract1 compose(Abstract1 r, Abstract1 t) throws ApronException {
-        Abstract1 a1 = rename(r, OUT, MID);     // r over (i, m)
+        Abstract1 a1 = rename(r, OUT, MID);     // r over (i, m) — fresh copy (r/t not disposed)
         Abstract1 a2 = rename(t, IN, MID);      // t over (m, o)
         List<String> joint = new ArrayList<String>();
         for (int k = 0; k < n; k++) joint.add(IN + k);
         for (int k = 0; k < n; k++) joint.add(MID + k);
         for (int k = 0; k < n; k++) joint.add(OUT + k);
         Environment je = new Environment(new String[0], joint.toArray(new String[0]));
-        Abstract1 met = a1.changeEnvironmentCopy(man, je, false)
-                          .meetCopy(man, a2.changeEnvironmentCopy(man, je, false));
+        Abstract1 a1j = a1.changeEnvironmentCopy(man, je, false);
+        Abstract1 a2j = a2.changeEnvironmentCopy(man, je, false);
+        Abstract1 met = a1j.meetCopy(man, a2j);
+        a1.dispose(); a2.dispose(); a1j.dispose(); a2j.dispose();   // all fresh, non-escaping — dead
         String[] keep = new String[2 * n];
         for (int k = 0; k < n; k++) { keep[k] = IN + k; keep[n + k] = OUT + k; }
-        return met.changeEnvironmentCopy(man, new Environment(new String[0], keep), true);
+        Abstract1 res = met.changeEnvironmentCopy(man, new Environment(new String[0], keep), true);
+        met.dispose();
+        return res;   // escapes (comp in run())
     }
 
     private Abstract1 rename(Abstract1 a, String fromPfx, String toPfx) throws ApronException {

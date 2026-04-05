@@ -44,6 +44,36 @@ final class ApronBridge {
     private ApronBridge() {}
 
     // -------------------------------------------------------------------------
+    // Native lifetime — free dead intermediates on the proof thread
+    // -------------------------------------------------------------------------
+
+    /**
+     * Frees the superseded intermediate {@code old} on THIS (the proof) thread and returns
+     * its replacement {@code neo}. The chained Apron transfers in the ranking tiers
+     * ({@code meetCopy}, {@code changeEnvironmentCopy}, {@code joinCopy}, {@code renameCopy},
+     * {@code widening}) each allocate a fresh native polyhedron and leave the previous one
+     * dead. Left to the GC those are freed asynchronously by the JVM {@code Cleaner} daemon,
+     * which calls into the per-thread {@code Polka} manager while a proof may still be
+     * mid-operation on the same manager — and NewPolka is not safe under concurrent
+     * operations (see {@link ApronManagers}), so an async free racing a live op can corrupt
+     * native state. Disposing each dead intermediate synchronously, on the proof thread,
+     * keeps it off the Cleaner's queue (deterministic same-thread free) and bounds the live
+     * native footprint. Apply ONLY to a value that neither escapes nor aliases a still-live
+     * one; use {@link #disposeUnless} when the value may alias a protected input.
+     */
+    static Abstract1 supersede(Abstract1 old, Abstract1 neo) {
+        if (old != null) old.dispose();
+        return neo;
+    }
+
+    /** Disposes {@code x} unless it is {@code null} or is the protected {@code keep} — the
+     *  guard for a chain whose first link may alias an input ({@code a = cond ? in : in.copy()}).
+     *  {@code Abstract1.dispose()} is idempotent, so a double call is a safe no-op. */
+    static void disposeUnless(Abstract1 x, Abstract1 keep) {
+        if (x != null && x != keep) x.dispose();
+    }
+
+    // -------------------------------------------------------------------------
     // ITS → Apron (always exact)
     // -------------------------------------------------------------------------
 

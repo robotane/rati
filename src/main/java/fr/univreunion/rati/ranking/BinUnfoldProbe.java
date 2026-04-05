@@ -187,8 +187,12 @@ public final class BinUnfoldProbe {
     static List<ItsLinearConstraint> loopRelation(IntegerTransitionSystem its, Set<String> scc,
             Map<String, List<ItsTransition>> bySource, String h, long perHeaderMs) throws ApronException {
         Abstract1 loopRel = closeHeaderRel(its, scc, bySource, h, perHeaderMs).loopRel;
-        if (loopRel.isBottom(man())) return null;
-        return ApronBridge.toConstraints(man(), loopRel);
+        try {
+            if (loopRel.isBottom(man())) return null;
+            return ApronBridge.toConstraints(man(), loopRel);
+        } finally {
+            loopRel.dispose();   // read back into constraints — the native relation is now dead
+        }
     }
 
     /** Runs the widened forward relational closure from {@code h} and returns R_hh. */
@@ -227,11 +231,14 @@ public final class BinUnfoldProbe {
                 Abstract1 post = relPost(src, t, iSide);
                 Abstract1 old = rel.get(tgt);
                 Abstract1 joined = old.joinCopy(man(), post);
+                post.dispose();   // consumed by the join — dead, never aliased
                 int v = visits.getOrDefault(tgt, 0) + 1; visits.put(tgt, v);
-                if (v > WIDEN_DELAY) joined = old.widening(man(), joined);
+                if (v > WIDEN_DELAY) joined = ApronBridge.supersede(joined, old.widening(man(), joined));
                 if (!joined.isIncluded(man(), old)) {
                     rel.put(tgt, joined);
                     if (inWork.add(tgt)) work.add(tgt);
+                } else {
+                    joined.dispose();   // not propagated — dead
                 }
             }
         }
@@ -242,9 +249,15 @@ public final class BinUnfoldProbe {
         Abstract1 loopRel = new Abstract1(man(), envIC(iSide, its.location(h)), true);
         for (String s : scc)
             for (ItsTransition t : bySource.getOrDefault(s, Collections.emptyList()))
-                if (t.target().name().equals(h) && !rel.get(s).isBottom(man()))
-                    loopRel = loopRel.joinCopy(man(), relPost(rel.get(s), t, iSide));
-
+                if (t.target().name().equals(h) && !rel.get(s).isBottom(man())) {
+                    Abstract1 pi = relPost(rel.get(s), t, iSide);   // fresh copy (relPost returns a copy)
+                    loopRel = ApronBridge.supersede(loopRel, loopRel.joinCopy(man(), pi));
+                    pi.dispose();
+                }
+        // The fixpoint relations are now folded into loopRel (through copies); free them here on
+        // the proof thread rather than leaving the whole map to the Cleaner. loopRel escapes in
+        // the Closure and is disposed by the caller after read-back; it is never a map value.
+        for (Abstract1 v : rel.values()) if (v != null) v.dispose();
         return new Closure(loopRel, iters, converged, System.currentTimeMillis() - start);
     }
 
@@ -298,6 +311,7 @@ public final class BinUnfoldProbe {
                 }
             }
         }
+        loopRel.dispose();   // read into HeaderResult (counts only) — native relation now dead
         return res;
     }
 
@@ -308,6 +322,8 @@ public final class BinUnfoldProbe {
 
         // 1. Rename rel's C@srcFormals back to the raw guard names (LI0, SI0, …).
         String[] cFrom = pref("C@", sv);
+        // a may alias the caller's rel (when sv is empty); guard the first dispose so we free
+        // only a copy we made, never the input. Every step after is a fresh copy (supersede).
         Abstract1 a = sv.isEmpty() ? rel : rel.renameCopy(man(), cFrom.clone(), sv.toArray(new String[0]));
 
         // 2. Full env: I@* ∪ raw src formals ∪ guard/update vars ∪ fresh res.
@@ -319,21 +335,23 @@ public final class BinUnfoldProbe {
         String[] resv = new String[tv.size()];
         for (int j = 0; j < resv.length; j++) { resv[j] = "__r" + j; names.add(resv[j]); }
         Environment full = new Environment(new String[0], names.toArray(new String[0]));
-        a = a.changeEnvironmentCopy(man(), full, false);
+        Abstract1 aFull = a.changeEnvironmentCopy(man(), full, false);
+        ApronBridge.disposeUnless(a, rel);   // free the rename copy if we made one; never rel
+        a = aFull;
 
         // 3. Meet guard, bind res_j = update_j.
         List<Lincons1> cons = new ArrayList<Lincons1>();
         for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(full, c));
         for (int j = 0; j < resv.length; j++) cons.add(ApronBridge.bindEq(full, resv[j], t.updates().get(j)));
-        if (!cons.isEmpty()) a = a.meetCopy(man(), cons.toArray(new Lincons1[0]));
+        if (!cons.isEmpty()) a = ApronBridge.supersede(a, a.meetCopy(man(), cons.toArray(new Lincons1[0])));
 
         // 4. Project to I@* ∪ res*, rename res_j → C@tgtFormals_j.
         Set<String> keep = new LinkedHashSet<String>();
         Collections.addAll(keep, iSide);
         Collections.addAll(keep, resv);
-        a = a.changeEnvironmentCopy(man(), new Environment(new String[0], keep.toArray(new String[0])), true);
-        if (resv.length > 0) a = a.renameCopy(man(), resv.clone(), pref("C@", tv));
-        return a.changeEnvironmentCopy(man(), envIC(iSide, t.target()), false);
+        a = ApronBridge.supersede(a, a.changeEnvironmentCopy(man(), new Environment(new String[0], keep.toArray(new String[0])), true));
+        if (resv.length > 0) a = ApronBridge.supersede(a, a.renameCopy(man(), resv.clone(), pref("C@", tv)));
+        return ApronBridge.supersede(a, a.changeEnvironmentCopy(man(), envIC(iSide, t.target()), false));
     }
 
     // --------------------------------------------------------------- Apron util
@@ -358,7 +376,10 @@ public final class BinUnfoldProbe {
             terms.put("C@" + v, BigInteger.valueOf(-1));
             cons.add(new Lincons1(Lincons1.EQ, ApronBridge.linexpr(env, terms, BigInteger.ZERO)));
         }
-        return cons.isEmpty() ? a : a.meetCopy(man(), cons.toArray(new Lincons1[0]));
+        if (cons.isEmpty()) return a;
+        Abstract1 met = a.meetCopy(man(), cons.toArray(new Lincons1[0]));
+        a.dispose();   // the ⊤ seed is superseded by the meet — dead
+        return met;
     }
 
     /**
@@ -370,7 +391,10 @@ public final class BinUnfoldProbe {
         Map<String, BigInteger> neg = new LinkedHashMap<String, BigInteger>();
         for (Map.Entry<String, BigInteger> e : terms.entrySet()) neg.put(e.getKey(), e.getValue().negate());
         Linexpr1 le = ApronBridge.linexpr(a.getEnvironment(), neg, c.negate().subtract(BigInteger.ONE));
-        return a.meetCopy(man(), new Lincons1(Lincons1.SUPEQ, le)).isBottom(man());
+        Abstract1 m = a.meetCopy(man(), new Lincons1(Lincons1.SUPEQ, le));   // a is the caller's — not disposed
+        boolean bot = m.isBottom(man());
+        m.dispose();
+        return bot;
     }
 
     private static String[] pref(String p, List<String> vs) {
