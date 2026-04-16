@@ -597,16 +597,33 @@ public final class NonTermination {
     // -------------------------------------------------------------------------
 
     /**
-     * Builds the full witness: a BFS path entry → head, its exact composition,
-     * and an integer entry point satisfying the path guards with its image in
-     * {@code G}. Every numeric fact is re-checked by BigInteger substitution
-     * before the witness is returned.
+     * Builds the full witness: a BFS path entry → head and an integer entry point
+     * whose run reaches {@code G}. The fast {@link #witnessComposed} tries first;
+     * when it fails because it fixed a nondeterministic prefix update to 0, the
+     * existential {@link #witnessViaPathLp} re-solves the path letting that update
+     * be chosen. Every numeric fact is re-checked by BigInteger substitution before
+     * a witness is returned.
      */
     private Witness witness(IntegerTransitionSystem its, String entry, Step loop,
             List<Cons> g, List<ItsTransition> cycle) {
         List<ItsTransition> path = bfsPath(its, entry, loop.src.name());
         if (path == null) return null;
+        Witness w = witnessComposed(its, entry, loop, g, cycle, path);
+        if (w != null) return w;
+        if (Boolean.getBoolean("rati.noReachFallback")) return null;   // A/B kill-switch
+        return witnessViaPathLp(its, entry, loop, g, cycle, path);
+    }
 
+    /**
+     * Fast reachability: composes the prefix into one relation over the entry
+     * formals and solves for an integer entry point. Determinisation fixes each
+     * nondeterministic update variable to 0 — a sound restriction, but one that
+     * also zeroes a value the callee genuinely leaves free (a field-ghost havoced
+     * at a divergent-call edge), so this can miss a reachable recurrent set; the
+     * caller then falls back to {@link #witnessViaPathLp}.
+     */
+    private Witness witnessComposed(IntegerTransitionSystem its, String entry, Step loop,
+            List<Cons> g, List<ItsTransition> cycle, List<ItsTransition> path) {
         ItsLocation entryLoc = its.location(entry);
         Step sigma = identity(entryLoc);
         for (ItsTransition t : path) {
@@ -634,6 +651,173 @@ public final class NonTermination {
         return new Witness(loop.src.name(), render(g, loop.src.variables()), cycle, path,
                 renderStep(loop), stateMap(entryLoc.variables(), x0),
                 stateMap(loop.src.variables(), h));
+    }
+
+    /**
+     * Reachability fallback (existential prefix). {@link #witnessComposed} fixes
+     * every nondeterministic prefix update variable to 0 — sound, but it also zeroes
+     * a value the callee genuinely leaves free, e.g. a field-ghost local havoced at a
+     * divergent-call edge ({@code b_caller -> b_callee(…, LOk, …)}, {@code LOk} a fresh
+     * unconstrained variable). This re-solves the entry → head path as an explicit SSA
+     * system — one fresh integer column per (path copy, formal) plus one per transition
+     * auxiliary (primed) variable, related by the guards and the update equalities, with
+     * {@code G} asserted at the head copy — so each free update variable is an existential
+     * the exact-rational LP may choose. The recurrent set {@code G} is unchanged (already
+     * Farkas-inductive); only the concrete entry synthesis differs, and the result is
+     * re-verified by exact BigInteger replay of every path transition and one loop step.
+     * Runs only after the fast path fails, so it never slows a case that path settles.
+     * Returns null on any failure — never an unsound witness.
+     */
+    private Witness witnessViaPathLp(IntegerTransitionSystem its, String entry, Step loop,
+            List<Cons> g, List<ItsTransition> cycle, List<ItsTransition> path) {
+        if (path.isEmpty()) return null;   // entry is the head: no prefix to re-solve
+        int k = path.size();
+
+        // Copies 0..k along the path (copy 0 = entry, copy k = loop head).
+        List<ItsLocation> locs = new ArrayList<ItsLocation>();
+        locs.add(its.location(entry));
+        for (ItsTransition t : path) locs.add(t.target());
+
+        // Columns: one per (copy, formal), then one per transition auxiliary variable
+        // (a name in the guard/updates that is not a source formal — the primed output
+        // vars, including the free ones). Every column ranges over ℤ (markFree).
+        List<int[]> copyCol = new ArrayList<int[]>();
+        List<Map<String, Integer>> auxCol = new ArrayList<Map<String, Integer>>();
+        int cols = 0;
+        for (ItsLocation loc : locs) {
+            int[] c = new int[loc.arity()];
+            for (int p = 0; p < c.length; p++) c[p] = cols++;
+            copyCol.add(c);
+        }
+        for (int i = 0; i < k; i++) {
+            ItsTransition t = path.get(i);
+            Set<String> src = new HashSet<String>(t.source().variables());
+            Map<String, Integer> a = new LinkedHashMap<String, Integer>();
+            for (ItsLinearConstraint con : t.constraints())
+                for (String v : con.lhs().variables())
+                    if (!src.contains(v) && !a.containsKey(v)) a.put(v, cols++);
+            for (ItsLinearExpression u : t.updates())
+                for (String v : u.variables())
+                    if (!src.contains(v) && !a.containsKey(v)) a.put(v, cols++);
+            auxCol.add(a);
+        }
+
+        LinearProgram lp = new LinearProgram(cols);
+        for (int j = 0; j < cols; j++) lp.markFree(j);
+
+        for (int i = 0; i < k; i++) {
+            ItsTransition t = path.get(i);
+            List<String> src = t.source().variables();
+            Map<String, Integer> pos = new HashMap<String, Integer>();
+            for (int p = 0; p < src.size(); p++) pos.put(src.get(p), copyCol.get(i)[p]);
+            Map<String, Integer> aux = auxCol.get(i);
+            // Guard lhs OP 0, strict form tightened over ℤ (e > 0 ⇒ e ≥ 1).
+            for (ItsLinearConstraint con : t.constraints()) {
+                Rational[] row = zeros(cols);
+                for (Map.Entry<String, Long> e : con.lhs().coefficients().entrySet())
+                    row[colOf(e.getKey(), pos, aux)] = Rational.of(e.getValue());
+                long rhs = Math.negateExact(con.lhs().constant());
+                if (con.op() == ItsLinearConstraint.Op.GT) rhs = Math.addExact(rhs, 1);
+                lp.addConstraint(row, con.op() == ItsLinearConstraint.Op.EQ
+                        ? LinearProgram.Op.EQ : LinearProgram.Op.GE, Rational.of(rhs));
+            }
+            // Update: target copy (i+1) formal j equals update_j over src + aux.
+            List<ItsLinearExpression> upd = t.updates();
+            int[] tgt = copyCol.get(i + 1);
+            for (int j = 0; j < upd.size(); j++) {
+                Rational[] row = zeros(cols);
+                row[tgt[j]] = Rational.ONE;
+                for (Map.Entry<String, Long> e : upd.get(j).coefficients().entrySet()) {
+                    int col = colOf(e.getKey(), pos, aux);
+                    row[col] = row[col].subtract(Rational.of(e.getValue()));
+                }
+                lp.addConstraint(row, LinearProgram.Op.EQ, Rational.of(upd.get(j).constant()));
+            }
+        }
+        // G at the head copy.
+        int[] headCols = copyCol.get(k);
+        for (Cons c : g) {
+            Rational[] row = zeros(cols);
+            for (int p = 0; p < c.f.c.length; p++)
+                if (c.f.c[p] != 0) row[headCols[p]] = Rational.of(c.f.c[p]);
+            lp.addConstraint(row, c.eq ? LinearProgram.Op.EQ : LinearProgram.Op.GE,
+                    Rational.of(Math.negateExact(c.f.k)));
+        }
+
+        LinearProgram.Solution sol = lp.solve();
+        if (!sol.feasible || sol.x == null) return null;
+
+        // Vertex, then uniform roundings — each re-verified exactly by replay.
+        for (int mode : new int[] {0, -1, 1}) {
+            Witness w = replay(its, entry, loop, g, cycle, path, locs, copyCol, auxCol,
+                    roundEach(sol.x, mode));
+            if (w != null) return w;
+        }
+        return null;
+    }
+
+    /** Column of {@code v} in a transition's scope: its source-formal copy, else its aux column. */
+    private static int colOf(String v, Map<String, Integer> pos, Map<String, Integer> aux) {
+        Integer c = pos.get(v);
+        return c != null ? c : aux.get(v);
+    }
+
+    /**
+     * Exact BigInteger re-verification of a candidate SSA assignment: every path
+     * transition's guard holds and its updates match the next copy, the head copy
+     * lies in {@code G}, and one determinised loop step stays in {@code G}. Builds
+     * the {@link Witness} on success, else null.
+     */
+    private Witness replay(IntegerTransitionSystem its, String entry, Step loop,
+            List<Cons> g, List<ItsTransition> cycle, List<ItsTransition> path,
+            List<ItsLocation> locs, List<int[]> copyCol, List<Map<String, Integer>> auxCol,
+            BigInteger[] all) {
+        int k = path.size();
+        for (int i = 0; i < k; i++) {
+            ItsTransition t = path.get(i);
+            List<String> src = t.source().variables();
+            Map<String, BigInteger> env = new HashMap<String, BigInteger>();
+            for (int p = 0; p < src.size(); p++) env.put(src.get(p), all[copyCol.get(i)[p]]);
+            for (Map.Entry<String, Integer> e : auxCol.get(i).entrySet())
+                env.put(e.getKey(), all[e.getValue()]);
+            for (ItsLinearConstraint con : t.constraints())
+                if (!holds(con, env)) return null;
+            List<ItsLinearExpression> upd = t.updates();
+            int[] tgt = copyCol.get(i + 1);
+            for (int j = 0; j < upd.size(); j++)
+                if (evalExpr(upd.get(j), env).compareTo(all[tgt[j]]) != 0) return null;
+        }
+        BigInteger[] h = new BigInteger[copyCol.get(k).length];
+        for (int p = 0; p < h.length; p++) h[p] = all[copyCol.get(k)[p]];
+        if (!satisfies(g, h)) return null;
+        if (!satisfies(loop.guard, h)) return null;
+        if (!satisfies(g, evalUpdate(loop.update, h))) return null;
+
+        BigInteger[] x0 = new BigInteger[copyCol.get(0).length];
+        for (int p = 0; p < x0.length; p++) x0[p] = all[copyCol.get(0)[p]];
+        return new Witness(loop.src.name(), render(g, loop.src.variables()), cycle, path,
+                renderStep(loop), stateMap(locs.get(0).variables(), x0),
+                stateMap(loop.src.variables(), h));
+    }
+
+    /** Value of {@code e} under an integer environment (absent variables count as 0). */
+    private static BigInteger evalExpr(ItsLinearExpression e, Map<String, BigInteger> env) {
+        BigInteger r = BigInteger.valueOf(e.constant());
+        for (Map.Entry<String, Long> t : e.coefficients().entrySet()) {
+            BigInteger v = env.get(t.getKey());
+            if (v != null) r = r.add(BigInteger.valueOf(t.getValue()).multiply(v));
+        }
+        return r;
+    }
+
+    /** Whether {@code con} ({@code lhs OP 0}) holds under an integer environment. */
+    private static boolean holds(ItsLinearConstraint con, Map<String, BigInteger> env) {
+        int s = evalExpr(con.lhs(), env).signum();
+        switch (con.op()) {
+            case EQ: return s == 0;
+            case GT: return s > 0;
+            default: return s >= 0;   // GE
+        }
     }
 
     /** The determinised self-loop update as {@code X' = …} lines, over the head's formals. */
