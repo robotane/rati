@@ -1227,20 +1227,15 @@ public final class FarkasRanking {
         LinearProgram.Solution solveMaximisingStrictness(List<ItsTransition> active) {
             LinearProgram lp = new LinearProgram(next);
             for (int v : freeVars) lp.markFree(v);   // λ coefficients are unrestricted in sign
+            // Rows go to the LP sparse, as built: densifying them here allocated a
+            // rows×columns lattice of ZERO references that dominated the heap peak.
             for (int r = 0; r < rows.size(); r++)
-                lp.addConstraint(dense(rows.get(r)), ops.get(r), rhs.get(r));
+                lp.addConstraint(rows.get(r), ops.get(r), rhs.get(r));
             Rational[] obj = new Rational[next];
             for (int j = 0; j < next; j++) obj[j] = Rational.ZERO;
             for (ItsTransition t : active) obj[eps.get(t)] = Rational.ONE;
             lp.setObjective(obj);
             return lp.solve();
-        }
-
-        private Rational[] dense(Map<Integer, Rational> sparse) {
-            Rational[] r = new Rational[next];
-            for (int j = 0; j < next; j++) r[j] = Rational.ZERO;
-            for (Map.Entry<Integer, Rational> e : sparse.entrySet()) r[e.getKey()] = e.getValue();
-            return r;
         }
     }
 }

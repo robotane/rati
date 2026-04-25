@@ -138,7 +138,9 @@ final class MultiphaseRanking {
             }
             LinearProgram lp = new LinearProgram(next);
             for (int v : freeVars) lp.markFree(v);
-            for (int r = 0; r < rows.size(); r++) lp.addConstraint(dense(rows.get(r)), ops.get(r), rhs.get(r));
+            // Rows go to the LP sparse, as built (see FarkasRanking.Builder: densifying
+            // them allocated the rows×columns ZERO lattice that dominated the heap peak).
+            for (int r = 0; r < rows.size(); r++) lp.addConstraint(rows.get(r), ops.get(r), rhs.get(r));
             return lp;
         }
 
@@ -301,13 +303,6 @@ final class MultiphaseRanking {
 
         private void pushEq(Map<Integer, Rational> eq, Rational r) {
             rows.add(eq); ops.add(LinearProgram.Op.EQ); rhs.add(r);
-        }
-
-        private Rational[] dense(Map<Integer, Rational> sparse) {
-            Rational[] r = new Rational[next];
-            for (int j = 0; j < next; j++) r[j] = Rational.ZERO;
-            for (Map.Entry<Integer, Rational> e : sparse.entrySet()) r[e.getKey()] = e.getValue();
-            return r;
         }
     }
 }

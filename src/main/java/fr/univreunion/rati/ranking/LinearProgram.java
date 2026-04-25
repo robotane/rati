@@ -31,11 +31,29 @@ public final class LinearProgram {
     /** Constraint relation. */
     public enum Op { LE, GE, EQ }
 
+    /**
+     * One constraint, stored sparse: only the nonzero structural coefficients, as
+     * parallel arrays sorted by strictly increasing column index. The synthesiser's
+     * Farkas LPs are huge and hollow — tens of thousands of λ/μ columns with a
+     * handful of nonzeros per row — so materialising each row densely put the whole
+     * heap into arrays of {@code Rational.ZERO} references (measured: 96% of a 1.5 GB
+     * heap at OOM was {@code Rational[]}). Sparse rows store exactly the nonzeros.
+     */
     private static final class Row {
-        final Rational[] a;     // coefficients over structural variables
+        final int[] idx;        // strictly increasing column indices of the nonzeros
+        final Rational[] val;   // parallel nonzero coefficients
         final Op op;
         final Rational rhs;
-        Row(Rational[] a, Op op, Rational rhs) { this.a = a; this.op = op; this.rhs = rhs; }
+        Row(int[] idx, Rational[] val, Op op, Rational rhs) {
+            this.idx = idx; this.val = val; this.op = op; this.rhs = rhs;
+        }
+        /** Dense structural-coefficient view (Bareiss engine only, opt-in path). */
+        Rational[] dense(int numVars) {
+            Rational[] a = new Rational[numVars];
+            java.util.Arrays.fill(a, Rational.ZERO);
+            for (int k = 0; k < idx.length; k++) a[idx[k]] = val[k];
+            return a;
+        }
     }
 
     private final int numVars;
@@ -62,7 +80,39 @@ public final class LinearProgram {
     /** Adds {@code coeffs·x  op  rhs}. {@code coeffs} length must be {@code numVars}. */
     public void addConstraint(Rational[] coeffs, Op op, Rational rhs) {
         if (coeffs.length != numVars) throw new IllegalArgumentException("coeff arity");
-        rows.add(new Row(coeffs.clone(), op, rhs));
+        int nnz = 0;
+        for (int j = 0; j < numVars; j++) if (!coeffs[j].isZero()) nnz++;
+        int[] idx = new int[nnz];
+        Rational[] val = new Rational[nnz];
+        int k = 0;
+        for (int j = 0; j < numVars; j++)
+            if (!coeffs[j].isZero()) { idx[k] = j; val[k] = coeffs[j]; k++; }
+        rows.add(new Row(idx, val, op, rhs));
+    }
+
+    /**
+     * Sparse variant of {@link #addConstraint(Rational[], Op, Rational)}: the constraint's
+     * nonzero coefficients as a column-index → value map (absent columns are 0; explicit
+     * zero values are dropped). Entries are stored sorted by column index, so the engine's
+     * scans — and hence the pivot trajectory and every verdict — are identical to feeding
+     * the equivalent dense array. This is the path the ranking builders use: they assemble
+     * rows as sparse maps already, and densifying them was the allocation the heap died on.
+     */
+    public void addConstraint(java.util.Map<Integer, Rational> coeffs, Op op, Rational rhs) {
+        int nnz = 0;
+        for (java.util.Map.Entry<Integer, Rational> e : coeffs.entrySet()) {
+            int j = e.getKey().intValue();
+            if (j < 0 || j >= numVars) throw new IllegalArgumentException("coeff index");
+            if (!e.getValue().isZero()) nnz++;
+        }
+        int[] idx = new int[nnz];
+        int k = 0;
+        for (java.util.Map.Entry<Integer, Rational> e : coeffs.entrySet())
+            if (!e.getValue().isZero()) idx[k++] = e.getKey().intValue();
+        java.util.Arrays.sort(idx);
+        Rational[] val = new Rational[nnz];
+        for (int i = 0; i < nnz; i++) val[i] = coeffs.get(Integer.valueOf(idx[i]));
+        rows.add(new Row(idx, val, op, rhs));
     }
 
     public void setObjective(Rational[] coeffs) {
@@ -276,27 +326,82 @@ public final class LinearProgram {
         if (bd.workSpent > WORK_BUDGET) throw new BudgetExceeded();
     }
 
+    /**
+     * One simplex-tableau row, sparse: parallel arrays of strictly increasing column
+     * indices and their nonzero {@link Rational} values (stored zeros never appear; an
+     * entry that cancels to zero during a pivot is dropped). Value-wise this is exactly
+     * the dense row — {@link #get} returns {@link Rational#ZERO} for an absent column —
+     * and every engine decision (entering scan, min-ratio, drive-out, extract) reads
+     * values only, so the pivot trajectory is byte-identical to the dense tableau while
+     * the storage is proportional to the nonzeros instead of {@code m × cols}.
+     */
+    private static final class SpRow {
+        int[] idx;
+        Rational[] val;
+        int n;
+        SpRow(int cap) { idx = new int[cap]; val = new Rational[cap]; }
+        /** Appends {@code (j, v)}; callers append in strictly increasing column order. */
+        void append(int j, Rational v) { idx[n] = j; val[n] = v; n++; }
+        /** The value in column {@code j} ({@link Rational#ZERO} when absent). */
+        Rational get(int j) {
+            int lo = 0, hi = n - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >>> 1;
+                if (idx[mid] < j) lo = mid + 1;
+                else if (idx[mid] > j) hi = mid - 1;
+                else return val[mid];
+            }
+            return Rational.ZERO;
+        }
+    }
+
+    /**
+     * {@code row − f·prow} as a fresh sparse row (ordered merge), dropping entries that
+     * cancel to exact zero. Arithmetic matches the dense update per column: both-present
+     * {@code v − f·p}, prow-only {@code 0 − f·p}, row-only unchanged (the dense loop
+     * skips zero pivot-row entries) — so every produced value, and hence every later
+     * sign / ratio test, is identical to the dense engine's.
+     */
+    private static SpRow subtractScaled(SpRow row, Rational f, SpRow prow) {
+        SpRow out = new SpRow(row.n + prow.n);
+        int a = 0, b = 0;
+        while (a < row.n || b < prow.n) {
+            int ja = a < row.n ? row.idx[a] : Integer.MAX_VALUE;
+            int jb = b < prow.n ? prow.idx[b] : Integer.MAX_VALUE;
+            if (ja < jb) {
+                out.append(ja, row.val[a]); a++;
+            } else if (jb < ja) {
+                out.append(jb, Rational.ZERO.subtract(f.multiply(prow.val[b]))); b++;
+            } else {
+                Rational v = row.val[a].subtract(f.multiply(prow.val[b]));
+                if (!v.isZero()) out.append(ja, v);
+                a++; b++;
+            }
+        }
+        return out;
+    }
+
     public Solution solveRational() {
         int m = rows.size();
 
         // Normalise every row to a non-negative right-hand side.
         Op[] op = new Op[m];
         Rational[] rhs = new Rational[m];
-        Rational[][] a = new Rational[m][];
+        boolean[] neg = new boolean[m];
         for (int i = 0; i < m; i++) {
             Row r = rows.get(i);
-            Rational[] ai = r.a.clone();
             Rational bi = r.rhs;
             Op oi = r.op;
             if (bi.isNegative()) {
-                for (int j = 0; j < numVars; j++) ai[j] = ai[j].negate();
+                neg[i] = true;
                 bi = bi.negate();
                 if (oi == Op.LE) oi = Op.GE; else if (oi == Op.GE) oi = Op.LE;
             }
-            a[i] = ai; rhs[i] = bi; op[i] = oi;
+            rhs[i] = bi; op[i] = oi;
         }
 
-        // Column layout: [structural | slack/surplus | artificial].
+        // Column layout: [structural | slack/surplus | artificial]; the rhs is carried
+        // in-row as virtual column `cols`, exactly where the dense tableau kept it.
         int nSlack = 0, nArt = 0;
         for (int i = 0; i < m; i++) {
             if (op[i] == Op.LE) nSlack++;
@@ -307,32 +412,36 @@ public final class LinearProgram {
         int artBase = numVars + nSlack;
         int cols = numVars + nSlack + nArt;
 
-        // Setup cost: tableau allocation + initial objective-row pricing are O(m × cols)
-        // and run before any pivot is charged. Charge them so a relaxed round that solves
-        // one (near-)zero-pivot LP per anchor on a huge SCC is bounded (see BUILD_BUDGET).
+        // Setup charge: kept at the dense tableau's nominal O(m × cols) — NOT the sparse
+        // engine's real O(nonzeros) cost — because the charge determines where an attempt
+        // aborts (BUILD_BUDGET) and the abort points must stay byte-identical to the
+        // calibrated dense engine's. See BUILD_BUDGET for why setup is charged at all.
         chargeBuild((long) m * cols);
 
-        Rational[][] T = new Rational[m][cols + 1];
+        SpRow[] T = new SpRow[m];
         int[] basis = new int[m];
         boolean[] isArtificial = new boolean[cols];
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j <= cols; j++) T[i][j] = Rational.ZERO;
 
         int s = slackBase, art = artBase;
         for (int i = 0; i < m; i++) {
-            for (int j = 0; j < numVars; j++) T[i][j] = a[i][j];
-            T[i][cols] = rhs[i];
+            Row r = rows.get(i);
+            // Appends stay strictly increasing: structural < numVars ≤ slack < art < cols.
+            SpRow row = new SpRow(r.idx.length + 3);
+            for (int k = 0; k < r.idx.length; k++)
+                row.append(r.idx[k], neg[i] ? r.val[k].negate() : r.val[k]);
             switch (op[i]) {
                 case LE:
-                    T[i][s] = Rational.ONE; basis[i] = s; s++;
+                    row.append(s, Rational.ONE); basis[i] = s; s++;
                     break;
                 case GE:
-                    T[i][s] = Rational.of(-1); s++;
-                    T[i][art] = Rational.ONE; isArtificial[art] = true; basis[i] = art; art++;
+                    row.append(s, Rational.of(-1)); s++;
+                    row.append(art, Rational.ONE); isArtificial[art] = true; basis[i] = art; art++;
                     break;
                 default: // EQ
-                    T[i][art] = Rational.ONE; isArtificial[art] = true; basis[i] = art; art++;
+                    row.append(art, Rational.ONE); isArtificial[art] = true; basis[i] = art; art++;
             }
+            if (!rhs[i].isZero()) row.append(cols, rhs[i]);
+            T[i] = row;
         }
 
         boolean[] forbidden = new boolean[cols];   // columns barred from entering
@@ -358,19 +467,19 @@ public final class LinearProgram {
             if (zrow[cols].isNegative()) return infeasible();   // Σ artificials > 0
 
             // Drive any artificial still in the basis out (or accept a redundant row).
+            // Sparse rows are sorted, so the first stored entry IS the dense scan's first
+            // non-zero column; it qualifies iff it lands before the artificial block.
             for (int i = 0; i < m; i++) {
                 if (basis[i] >= artBase) {
-                    int pc = -1;
-                    for (int j = 0; j < artBase; j++)
-                        if (!T[i][j].isZero()) { pc = j; break; }
-                    if (pc >= 0) pivot(T, basis, null, m, cols, i, pc);
+                    SpRow row = T[i];
+                    if (row.n > 0 && row.idx[0] < artBase) pivot(T, basis, null, m, cols, i, row.idx[0]);
                 }
             }
             for (int j = artBase; j < cols; j++) forbidden[j] = true;   // bar artificials in phase 2
         }
 
         if (objective == null) {
-            return new Solution(true, extract(T, basis, m), null);
+            return new Solution(true, extract(T, basis, m, cols), null);
         }
 
         // ---- Phase 2: maximise the real objective ----
@@ -379,15 +488,17 @@ public final class LinearProgram {
         Rational[] zrow = buildObjectiveRow(T, basis, c2, m, cols);
         if (!simplex(T, basis, zrow, forbidden, colFree, m, cols)) {
             // Unbounded: should not occur for our bounded ranking LPs. Treat as no useful optimum.
-            return new Solution(true, extract(T, basis, m), null);
+            return new Solution(true, extract(T, basis, m, cols), null);
         }
-        return new Solution(true, extract(T, basis, m), zrow[cols]);
+        return new Solution(true, extract(T, basis, m, cols), zrow[cols]);
     }
 
     // -------------------------------------------------------------------------
 
-    /** Builds the reduced-cost row for cost vector {@code c}, pricing out the basis. */
-    private static Rational[] buildObjectiveRow(Rational[][] T, int[] basis,
+    /** Builds the reduced-cost row for cost vector {@code c}, pricing out the basis.
+     *  The z-row itself stays dense — it is a single {@code cols+1} vector, and the
+     *  entering scans read it by ascending index — only the tableau rows are sparse. */
+    private static Rational[] buildObjectiveRow(SpRow[] T, int[] basis,
                                                 Rational[] c, int m, int cols) {
         Rational[] z = new Rational[cols + 1];
         for (int j = 0; j < cols; j++) z[j] = c[j].negate();   // zⱼ−cⱼ with z=0 initially
@@ -395,9 +506,9 @@ public final class LinearProgram {
         for (int i = 0; i < m; i++) {
             Rational cb = c[basis[i]];
             if (cb.isZero()) continue;
-            Rational[] row = T[i];
-            for (int j = 0; j <= cols; j++)
-                if (!row[j].isZero()) z[j] = z[j].add(cb.multiply(row[j]));   // cb·0 = 0: byte-id skip
+            SpRow row = T[i];
+            for (int k = 0; k < row.n; k++)   // the dense loop skipped zeros: same terms, same order
+                z[row.idx[k]] = z[row.idx[k]].add(cb.multiply(row.val[k]));
         }
         return z;
     }
@@ -431,7 +542,7 @@ public final class LinearProgram {
      * all-{@code ≥0} engine {@link #simplexNonneg} runs unchanged (byte-identical); when
      * some column is free, {@link #simplexFree} runs the signed-direction variant.
      */
-    private static boolean simplex(Rational[][] T, int[] basis, Rational[] z,
+    private static boolean simplex(SpRow[] T, int[] basis, Rational[] z,
                                    boolean[] forbidden, boolean[] colFree, int m, int cols) {
         return colFree == null
                 ? simplexNonneg(T, basis, z, forbidden, m, cols)
@@ -444,7 +555,7 @@ public final class LinearProgram {
      * (Dantzig with Bland fallback, or pure Bland), the leaving row by min-ratio with a
      * smallest-basis-index tie-break.
      */
-    private static boolean simplexNonneg(Rational[][] T, int[] basis, Rational[] z,
+    private static boolean simplexNonneg(SpRow[] T, int[] basis, Rational[] z,
                                          boolean[] forbidden, int m, int cols) {
         boolean bland = PRICING_BLAND;     // pure-Bland mode never leaves Bland
         int stall = 0;
@@ -473,8 +584,9 @@ public final class LinearProgram {
             int pr = -1;
             Rational best = null;
             for (int i = 0; i < m; i++) {
-                if (!T[i][pc].isPositive()) continue;
-                Rational ratio = T[i][cols].divide(T[i][pc]);
+                Rational tipc = T[i].get(pc);
+                if (!tipc.isPositive()) continue;
+                Rational ratio = T[i].get(cols).divide(tipc);
                 if (best == null || ratio.compareTo(best) < 0
                         || (ratio.compareTo(best) == 0 && basis[i] < basis[pr])) {
                     best = ratio; pr = i;
@@ -515,7 +627,7 @@ public final class LinearProgram {
      * count, so termination holds. Equivalent to the caller-side pos/neg split: same feasibility
      * and same optimum, one column per free coefficient instead of two.
      */
-    private static boolean simplexFree(Rational[][] T, int[] basis, Rational[] z,
+    private static boolean simplexFree(SpRow[] T, int[] basis, Rational[] z,
                                        boolean[] forbidden, boolean[] colFree, int m, int cols) {
         boolean bland = PRICING_BLAND;
         int stall = 0;
@@ -553,9 +665,10 @@ public final class LinearProgram {
             Rational best = null;
             for (int i = 0; i < m; i++) {
                 if (colFree[basis[i]]) continue;             // free basic var never leaves
-                Rational coef = dir == 1 ? T[i][pc] : T[i][pc].negate();
+                Rational tipc = T[i].get(pc);
+                Rational coef = dir == 1 ? tipc : tipc.negate();
                 if (!coef.isPositive()) continue;
-                Rational ratio = T[i][cols].divide(coef);
+                Rational ratio = T[i].get(cols).divide(coef);
                 if (best == null || ratio.compareTo(best) < 0
                         || (ratio.compareTo(best) == 0 && basis[i] < basis[pr])) {
                     best = ratio; pr = i;
@@ -572,42 +685,37 @@ public final class LinearProgram {
         }
     }
 
-    /** Gauss-Jordan pivot at {@code (pr,pc)}; updates basis and (if given) z-row. */
-    private static void pivot(Rational[][] T, int[] basis, Rational[] z,
+    /** Gauss-Jordan pivot at {@code (pr,pc)}; updates basis and (if given) z-row.
+     *  Structurally sparse: the pivot row's stored entries ARE the nonzeros the dense
+     *  update iterated (it skipped zeros), so dividing them, merging them into each
+     *  affected row ({@link #subtractScaled}) and pricing them out of the z-row perform
+     *  the same exact-rational operations in the same order — byte-identical basis,
+     *  optimum and certificate — without ever touching an absent (zero) column. */
+    private static void pivot(SpRow[] T, int[] basis, Rational[] z,
                               int m, int cols, int pr, int pc) {
-        // Sparse-aware exact pivot: the Farkas tableaux are wide but mostly zero, and
-        // f·0 = 0 (subtracting / dividing a zero is a no-op), so skipping zero entries
-        // of the pivot row is byte-identical to the dense update — same basis, same
-        // optimum, same certificate — while avoiding a bignum multiply+subtract per zero.
-        Rational[] prow = T[pr];
-        Rational p = prow[pc];
-        for (int j = 0; j <= cols; j++) if (!prow[j].isZero()) prow[j] = prow[j].divide(p);
+        SpRow prow = T[pr];
+        Rational p = prow.get(pc);
+        for (int k = 0; k < prow.n; k++) prow.val[k] = prow.val[k].divide(p);   // nonzero/p ≠ 0
         for (int i = 0; i < m; i++) {
             if (i == pr) continue;
-            Rational f = T[i][pc];
+            Rational f = T[i].get(pc);
             if (f.isZero()) continue;
-            Rational[] row = T[i];
-            for (int j = 0; j <= cols; j++) {
-                Rational prj = prow[j];
-                if (!prj.isZero()) row[j] = row[j].subtract(f.multiply(prj));
-            }
+            T[i] = subtractScaled(T[i], f, prow);
         }
         if (z != null) {
             Rational f = z[pc];
             if (!f.isZero())
-                for (int j = 0; j <= cols; j++) {
-                    Rational prj = prow[j];
-                    if (!prj.isZero()) z[j] = z[j].subtract(f.multiply(prj));
-                }
+                for (int k = 0; k < prow.n; k++)
+                    z[prow.idx[k]] = z[prow.idx[k]].subtract(f.multiply(prow.val[k]));
         }
         basis[pr] = pc;
     }
 
-    private Rational[] extract(Rational[][] T, int[] basis, int m) {
+    private Rational[] extract(SpRow[] T, int[] basis, int m, int cols) {
         Rational[] x = new Rational[numVars];
         for (int j = 0; j < numVars; j++) x[j] = Rational.ZERO;
         for (int i = 0; i < m; i++)
-            if (basis[i] < numVars) x[basis[i]] = T[i][T[i].length - 1];
+            if (basis[i] < numVars) x[basis[i]] = T[i].get(cols);
         return x;
     }
 
@@ -645,7 +753,7 @@ public final class LinearProgram {
         BigInteger[][] a = new BigInteger[m][numVars];
         for (int i = 0; i < m; i++) {
             Row r = rows.get(i);
-            Rational[] ai = r.a;
+            Rational[] ai = r.dense(numVars);   // Bareiss keeps its dense integer tableau
             Rational bi = r.rhs;
             Op oi = r.op;
             if (bi.isNegative()) {
