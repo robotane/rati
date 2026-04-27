@@ -8,7 +8,9 @@ format and answers `TERMINATES` (with a ranking-function certificate),
 
 The engine is language-agnostic — it only consumes an ITS, so any front-end that
 can emit KoAT (bytecode, EVM/Wasm, hand-written models) can be proved terminating
-with it.
+with it; an embedder can also skip the text format and hand an ITS *object*
+straight to the engine (see *Library use*), which is how BCTerm runs it
+in-process.
 
 ## What it does
 
@@ -20,12 +22,21 @@ well-founded by searching, in order:
    Farkas-encoded bounded/decrease implications, maximal-strict peeling, in exact
    rational arithmetic.
 2. **Polyhedral invariants** (Apron, widening + narrowing) injected as extra
-   premises — the boundedness facts per-transition guards lack.
+   premises — the boundedness facts per-transition guards lack. Computed
+   *lazily*: a first invariant-free pass runs before the Apron fixpoint is paid
+   (`-Drati.lazyInvariants=false` restores the eager order).
 3. **Cut-point loop summarisation** (exact relational composition) for
    diamonds / nested loops.
 4. **Multiphase ranking** (MΦRF, Ben-Amram–Genaim, CAV 2017).
 5. **Disjunctive termination** (transition invariants, Podelski–Rybalchenko,
    LICS 2004) as a last resort.
+
+Every Farkas system is solved by an **exact rational simplex over sparse rows and
+a sparse tableau, with native free variables** (one column per unsigned unknown,
+no positive/negative split) — the LP layer stays exact at whole-program scale.
+The search is bounded *structurally* (deterministic work budgets on LP and
+invariant operations), not by wall-clock timers: verdicts are reproducible
+run-to-run and machine-independent.
 
 An SCC no ranking technique covers is then attacked from the other side —
 **non-termination by recurrent sets** (Gupta et al., POPL 2008):
@@ -37,9 +48,11 @@ An SCC no ranking technique covers is then attacked from the other side —
    by the bounded descending iteration `G ← G ∧ G∘s` (closed recurrence,
    Chen et al., TACAS 2014) and/or the polyhedral invariant — is checked
    **inductive by Farkas' lemma in exact rational arithmetic**;
-8. a **concrete integer entry state** reaching `G` is synthesised (LP + rounding)
-   and **re-verified by `BigInteger` substitution**: only then is `NONTERMINATES`
-   answered, with the recurrent set, the cycle, the path and the witness state.
+8. a **concrete integer entry state** reaching `G` is synthesised (LP + rounding,
+   with an existential fallback that leaves the prefix's unconstrained update
+   variables free instead of pinning them) and **re-verified by `BigInteger`
+   substitution**: only then is `NONTERMINATES` answered, with the recurrent set,
+   the cycle, the path and the witness state.
 
 A found ranking is a sound proof, a verified recurrent set a sound disproof; an
 undecided loop yields `UNKNOWN` (never a false verdict either way). Strict guards
@@ -56,6 +69,7 @@ Apron (the polyhedra library, JNI) is not on Maven Central, so its jars ship in
 
 ```bash
 mvn package                # runs tests, builds target/rati.jar
+mvn install                # additionally installs fr.univreunion:rati for embedders
 ```
 
 Requirements: JDK 8+ and Maven. The native libs in `lib/` are Linux x86-64
@@ -66,13 +80,21 @@ native builds.
 
 ```bash
 # Apron is JNI → point java.library.path at the native libs in lib/
-LD_LIBRARY_PATH=lib java -Djava.library.path=lib -jar target/rati.jar <file.koat> [--entry F] [--quiet]
+LD_LIBRARY_PATH=lib java -Djava.library.path=lib -jar target/rati.jar <file.koat> [--entry F] [--quiet] [--cpf out.xml]
 ```
 
 - `--entry <functor>` — start location (default: the `(STARTTERM …)` in the file);
 - `--quiet` — print only the verdict (no certificate);
+- `--cpf <file>` — on TERMINATES, export the proof as a **CPF certificate**
+  checkable by the CeTA verified certifier (forces the eager, exportable proof
+  shape);
 - exit code `0` = TERMINATES, `1` = UNKNOWN, `2` = usage / I/O error,
   `3` = NONTERMINATES.
+
+Two opt-in analysis modes (system properties): `-Drati.sctFirst=true` runs a
+no-Apron **size-change termination** triage before the Farkas path (a purely
+graph-based win short-circuits the LP entirely), and `-Drati.binterm=true` routes
+the verdict through the faithful BINTERM cascade (Algorithm 1, TOPLAS 2010 §7).
 
 A handy alias:
 
@@ -150,6 +172,11 @@ IntegerTransitionSystem its = KoatParser.parse(text).its;
 FarkasRanking.Certificate c = FarkasRanking.proveWithCertificate(its, "koat_init");
 // c.verdict ∈ {TERMINATES, NONTERMINATES, UNKNOWN};
 // c.sccs = per-SCC ranking certificate; c.nonTermination = recurrent-set witness
+
+int rc = RankMain.proveExitCode(its, "koat_init");
+// the zero-serialisation embedding face (same exit-code contract as the CLI):
+// hand an ITS OBJECT to the engine — no KoAT text, no child process. This is
+// how BCTerm runs RaTI in-process. Thread-safe.
 ```
 
 ## Layout
@@ -157,10 +184,13 @@ FarkasRanking.Certificate c = FarkasRanking.proveWithCertificate(its, "koat_init
 ```
 src/main/java/fr/univreunion/rati/
   its/        ITS data model (IntegerTransitionSystem, ItsLocation, ItsTransition,
-              ItsLinearConstraint, ItsLinearExpression, KoatPrinter)
-  ranking/    the prover: FarkasRanking, LinearProgram, Rational, ItsInvariants,
-              LoopSummary, MultiphaseRanking, DisjunctiveTermination, NonTermination
-  rank/       CLI: KoatParser, RankMain
+              ItsLinearConstraint, ItsLinearExpression, KoatPrinter, StackProjection)
+  ranking/    the prover: FarkasRanking, LinearProgram (sparse exact simplex),
+              Rational, ItsInvariants, LoopSummary, MultiphaseRanking,
+              DisjunctiveTermination, NonTermination, SizeChangeTermination,
+              BinTerm (the two opt-in modes above)
+  cpf/        CpfExporter — the --cpf certificate (CPF for CeTA)
+  rank/       CLI + embedding face: KoatParser, RankMain
 lib/          Apron/GMP native libraries (JNI)
 lib-repo/     Apron/GMP jars as a project-local Maven repository
 examples/     sample .koat inputs
@@ -176,6 +206,8 @@ bytecode-analysis code, keeping it front-end-agnostic.
 - Ben-Amram, Genaim — *Multiphase-Linear Ranking Functions and their Relation to
   Recurrent Sets*, CAV 2017.
 - Podelski, Rybalchenko — *Transition Invariants*, LICS 2004.
+- Lee, Jones, Ben-Amram — *The Size-Change Principle for Program Termination*,
+  POPL 2001.
 - Gupta, Henzinger, Majumdar, Rybalchenko, Xu — *Proving Non-Termination*,
   POPL 2008.
 - Chen, Cook, Fuhs, Nimkar, O'Hearn — *Proving Nontermination via Safety*,
