@@ -52,8 +52,9 @@
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
         <configuration>
-          <source>8</source>
-          <target>8</target>
+          <!-- release (not source/target): API usage is checked against the real
+               JDK 17 API, matching the BCTerm pom's floor. -->
+          <release>17</release>
         </configuration>
       </plugin>
       <plugin>
