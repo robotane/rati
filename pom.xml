@@ -89,6 +89,18 @@
           </execution>
         </executions>
       </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.6.3</version>
+        <configuration>
+          <!-- Full HTML/reference validation, minus the "missing" group
+               (no @param / @return / no comment). Matches the BCTerm pom. -->
+          <doclint>all,-missing</doclint>
+          <notimestamp>true</notimestamp>
+          <quiet>true</quiet>
+        </configuration>
+      </plugin>
     </plugins>
   </build>
 </project>

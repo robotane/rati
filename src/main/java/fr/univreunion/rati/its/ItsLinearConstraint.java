@@ -6,8 +6,8 @@ import apron.Lincons1;
  * A linear constraint {@code lhs OP 0} where {@code OP ∈ {=, ≥, >}}.
  *
  * <p>Mirrors the three Apron constraint kinds our path-length polyhedra ever
- * produce ({@link Lincons1#EQ}, {@link Lincons1#SUPEQ}, {@link Lincons1#SUP});
- * see {@link fr.univreunion.rati.clp.PolyToClp}. Keeping the comparison
+ * produce ({@code Lincons1.EQ}, {@code Lincons1.SUPEQ}, {@code Lincons1.SUP});
+ * see {@link fr.univreunion.rati.ranking.ApronBridge}. Keeping the comparison
  * structured (rather than as Prolog text) lets ITS backends read the relation
  * directly.
  */

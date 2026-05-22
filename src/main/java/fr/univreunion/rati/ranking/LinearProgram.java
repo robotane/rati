@@ -222,7 +222,7 @@ public final class LinearProgram {
      * per-anchor setup grinds tens of seconds while almost no pivot is ever charged
      * (confirmed by a thread dump parked in {@link #buildObjectiveRow}).
      *
-     * <p>Kept <em>separate</em> from {@link #workSpent} on purpose: a pivot-bound but
+     * <p>Kept <em>separate</em> from {@code workSpent} on purpose: a pivot-bound but
      * genuinely-provable method must not have its proof forgone because setup ate the pivot
      * budget. Exhaustion throws {@link BuildBudgetExceeded}, caught in {@link
      * FarkasRanking#prove} and turned into a deterministic UNKNOWN — sound, since (as with

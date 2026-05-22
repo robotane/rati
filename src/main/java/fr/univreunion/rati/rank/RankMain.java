@@ -76,7 +76,7 @@ public final class RankMain {
      * exact (non-over-approximated) system; the §8 transforms are applied here, exactly
      * as the text path applies them to {@code parsed.its}.
      *
-     * @param its   the integer transition system to rank (already built, not text)
+     * @param its0  the integer transition system to rank (already built, not text)
      * @param start the start functor; must be a location of {@code its}
      * @return {@code 0} TERMINATES, {@code 1} UNKNOWN, {@code 2} usage/setup error,
      *         {@code 3} NONTERMINATES
