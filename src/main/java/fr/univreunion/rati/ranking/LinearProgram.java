@@ -303,7 +303,9 @@ public final class LinearProgram {
         // opt-in worst-case coefficient bound, not the measured default, so this only
         // affects the rare -Drati.exactArith=bareiss + native-free combination.
         boolean bareiss = USE_BAREISS && !anyFree;
-        if (WORK_BUDGET <= 0) return bareiss ? solveFractionFree() : solveRational();
+        // No WORK_BUDGET<=0 shortcut around the try: chargePivot can still throw for
+        // the tier-local MPHI_WORK_BUDGET while a multiphase window is open, and that
+        // abort must degrade to an infeasible attempt, not escape as an engine error.
         try {
             return bareiss ? solveFractionFree() : solveRational();
         } catch (BudgetExceeded e) {
