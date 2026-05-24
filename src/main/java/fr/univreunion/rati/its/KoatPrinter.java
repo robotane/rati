@@ -55,13 +55,19 @@ public final class KoatPrinter {
         // KoAT requires the initial location to have NO incoming transition. The
         // real entry block is often a loop head (it has a back-edge), so we start
         // from a fresh location koat_init whose only rule enters the real start.
+        // A system whose start IS koat_init was already wrapped (RatiItsBridge adds
+        // the same synthetic entry): re-emitting the rule here would print a spurious
+        // "koat_init -> koat_init" identity self-loop — an unrankable phantom SCC
+        // that poisons any re-parse of the printed text (the dumpRatiDir round-trip).
         StringBuilder sb = new StringBuilder();
         sb.append("(GOAL COMPLEXITY)\n");
         sb.append("(STARTTERM (FUNCTIONSYMBOLS ").append(INIT).append("))\n");
         sb.append("(VAR ").append(String.join(" ", vars)).append(")\n");
         sb.append("(RULES\n");
-        sb.append("  ").append(INIT).append('(').append(args).append(") -> ")
-          .append(startFunctor).append('(').append(args).append(")\n");
+        if (!INIT.equals(startFunctor)) {
+            sb.append("  ").append(INIT).append('(').append(args).append(") -> ")
+              .append(startFunctor).append('(').append(args).append(")\n");
+        }
         for (ItsTransition t : its.transitions()) {
             if (reachable.contains(t.source().name())) sb.append("  ").append(rule(t)).append('\n');
         }
