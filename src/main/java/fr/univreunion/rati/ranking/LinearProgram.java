@@ -205,6 +205,8 @@ public final class LinearProgram {
         long buildSpent;       // per-attempt cumulative LP-setup work
         long mphiSpent;        // pivot work charged inside the current MΦRF window
         boolean mphiActive;    // true between begin/endMphiWindow
+        long mphiHigh;         // per-attempt max mphiSpent seen (budgetStats only)
+        boolean attemptOpen;   // between beginProveWindow and recordAttempt (budgetStats)
     }
     private static final ThreadLocal<Budget> BUDGET = ThreadLocal.withInitial(Budget::new);
     private static Budget b() { return BUDGET.get(); }
@@ -269,8 +271,69 @@ public final class LinearProgram {
      */
     public static final long MPHI_WORK_BUDGET = Long.getLong("rati.mphiWorkBudget", 50_000_000L);
 
+    /**
+     * Switches every budget charge of the <em>rational</em> engine from the dense
+     * tableau's nominal unit to the sparse engine's real one. Since the sparse-row
+     * rewrite the solver's work is proportional to the nonzeros it touches, yet each
+     * pivot is still charged the full {@code m × cols} tableau area — a deliberate
+     * choice (see {@link #solveRational}'s setup charge) that kept every calibrated
+     * abort point byte-identical, at the price of over-charging large sparse ranking
+     * LPs by the tableau's fill ratio (measured ×30-70 on Kitten call-graph-recursive
+     * bodies), so genuinely provable methods there exhaust {@link #WORK_BUDGET} on
+     * work the solver never performs. Under this flag a pivot charges its priced
+     * scans plus the entries it actually rewrites ({@link #pivot} self-charges), and
+     * a solve's setup charges the rows' nonzeros instead of the dense area. The
+     * trajectory is untouched — only where an attempt aborts moves, so the budget
+     * constants must be recalibrated in the new unit before this can default on.
+     * The fraction-free (Bareiss) engine keeps the dense charge: its tableau IS
+     * dense, so area is its real cost. OFF keeps every abort point byte-identical.
+     */
+    static final boolean SPARSE_CHARGE = Boolean.getBoolean("rati.sparseCharge");
+
+    /**
+     * {@code -Drati.budgetStats=true}: tracks, across the JVM, the highest
+     * {@code workSpent}/{@code buildSpent}/MΦRF-window spend of any proved attempt
+     * versus any failed one, and prints the summary on shutdown. This is the
+     * measurement side of {@link #SPARSE_CHARGE}: budget constants are calibrated as
+     * "clear the heaviest genuine proof with margin, bound the heaviest grind", so
+     * re-unit-ing the charges requires exactly these four numbers in the new unit.
+     */
+    private static final boolean BUDGET_STATS = Boolean.getBoolean("rati.budgetStats");
+    private static final java.util.concurrent.atomic.AtomicLong[] STATS = {
+            new java.util.concurrent.atomic.AtomicLong(), // 0: max work, proved
+            new java.util.concurrent.atomic.AtomicLong(), // 1: max build, proved
+            new java.util.concurrent.atomic.AtomicLong(), // 2: max mphi-window, proved
+            new java.util.concurrent.atomic.AtomicLong(), // 3: max work, not proved
+            new java.util.concurrent.atomic.AtomicLong(), // 4: max build, not proved
+            new java.util.concurrent.atomic.AtomicLong(), // 5: max mphi-window, not proved
+    };
+    static {
+        if (BUDGET_STATS) Runtime.getRuntime().addShutdownHook(new Thread(() ->
+                System.err.println("[budgetStats] unit=" + (SPARSE_CHARGE ? "sparse" : "dense")
+                        + " proved: work=" + STATS[0] + " build=" + STATS[1] + " mphi=" + STATS[2]
+                        + " | unproved: work=" + STATS[3] + " build=" + STATS[4] + " mphi=" + STATS[5])));
+    }
+
+    /**
+     * Records the attempt that just ended (called once per {@link FarkasRanking#prove}
+     * from its outcome funnel). No-op unless {@code -Drati.budgetStats=true}.
+     */
+    static void recordAttempt(boolean proved) {
+        if (!BUDGET_STATS) return;
+        Budget bd = b();
+        if (!bd.attemptOpen) return;   // prove() bailed before opening a window
+        bd.attemptOpen = false;
+        int base = proved ? 0 : 3;
+        STATS[base].accumulateAndGet(bd.workSpent, Math::max);
+        STATS[base + 1].accumulateAndGet(bd.buildSpent, Math::max);
+        STATS[base + 2].accumulateAndGet(bd.mphiHigh, Math::max);
+    }
+
     /** Opens a fresh work-budget window for one ranking attempt (a {@link FarkasRanking#prove}). */
-    public static void beginProveWindow() { Budget bd = b(); bd.workSpent = 0; bd.buildSpent = 0; }
+    public static void beginProveWindow() {
+        Budget bd = b();
+        bd.workSpent = 0; bd.buildSpent = 0; bd.mphiHigh = 0; bd.attemptOpen = true;
+    }
 
     /** Opens a fresh MΦRF pivot-budget window (one {@link MultiphaseRanking#rank} call). */
     public static void beginMphiWindow() {
@@ -313,19 +376,42 @@ public final class LinearProgram {
         }
     }
 
-    /** Charges one pivot's worth of work and aborts the attempt if the budget is spent. */
-    private static void chargePivot(int m, int cols) {
+    /** Charges {@code work} units against the open windows; aborts the attempt when spent. */
+    private static void charge(long work) {
         Budget bd = b();
-        long work = (long) m * cols;
         // Tier-local MΦRF budget (when a multiphase window is open): bounds a degenerate
         // nested-RF grind without raising the global cap that clears the lexicographic tier.
         if (bd.mphiActive) {
             bd.mphiSpent += work;
+            if (BUDGET_STATS && bd.mphiSpent > bd.mphiHigh) bd.mphiHigh = bd.mphiSpent;
             if (bd.mphiSpent > MPHI_WORK_BUDGET) throw new BudgetExceeded();
         }
         if (WORK_BUDGET <= 0) return;
         bd.workSpent += work;
         if (bd.workSpent > WORK_BUDGET) throw new BudgetExceeded();
+    }
+
+    /**
+     * Charges one pivot at the dense tableau area. The Bareiss engine's only unit (its
+     * tableau IS dense); the rational engine's unit while {@link #SPARSE_CHARGE} is off.
+     */
+    private static void chargePivot(int m, int cols) {
+        charge((long) m * cols);
+    }
+
+    /**
+     * Charges one rational-simplex iteration. Dense mode: the nominal {@code m × cols}
+     * area, as always. Sparse mode: only the iteration's priced scans (entering scan of
+     * the dense z-row = {@code cols}, min-ratio scan = {@code m}); the pivot's rewrite
+     * work is then charged for real by {@link #pivot} via {@link #chargeOps}.
+     */
+    private static void chargeIteration(int m, int cols) {
+        charge(SPARSE_CHARGE ? (long) m + cols : (long) m * cols);
+    }
+
+    /** Sparse-unit charge for work actually performed (no-op in dense mode). */
+    private static void chargeOps(long ops) {
+        if (SPARSE_CHARGE) charge(ops);
     }
 
     /**
@@ -414,11 +500,21 @@ public final class LinearProgram {
         int artBase = numVars + nSlack;
         int cols = numVars + nSlack + nArt;
 
-        // Setup charge: kept at the dense tableau's nominal O(m × cols) — NOT the sparse
-        // engine's real O(nonzeros) cost — because the charge determines where an attempt
-        // aborts (BUILD_BUDGET) and the abort points must stay byte-identical to the
-        // calibrated dense engine's. See BUILD_BUDGET for why setup is charged at all.
-        chargeBuild((long) m * cols);
+        // Setup charge. Dense mode keeps the dense tableau's nominal O(m × cols) — NOT
+        // the sparse engine's real O(nonzeros) cost — because the charge determines where
+        // an attempt aborts (BUILD_BUDGET) and the abort points must stay byte-identical
+        // to the calibrated dense engine's. Sparse mode (rati.sparseCharge) charges the
+        // real setup instead: the rows built once (their nonzeros plus the ≤3 appended
+        // slack/artificial/rhs entries) and the ≤2 objective-row pricings (a cols-wide
+        // init plus at most the rows' nonzeros each). See BUILD_BUDGET for why setup is
+        // charged at all.
+        if (SPARSE_CHARGE) {
+            long nnz = 0;
+            for (int i = 0; i < m; i++) nnz += rows.get(i).idx.length;
+            chargeBuild(2L * cols + 3L * nnz + 4L * m);
+        } else {
+            chargeBuild((long) m * cols);
+        }
 
         SpRow[] T = new SpRow[m];
         int[] basis = new int[m];
@@ -595,7 +691,7 @@ public final class LinearProgram {
                 }
             }
             if (pr < 0) return false;                         // unbounded
-            chargePivot(m, cols);
+            chargeIteration(m, cols);
             pivot(T, basis, z, m, cols, pr, pc);
 
             // Anti-cycling: a long run of degenerate pivots (zero min-ratio ⇒ no
@@ -677,7 +773,7 @@ public final class LinearProgram {
                 }
             }
             if (pr < 0) return false;                         // unbounded
-            chargePivot(m, cols);
+            chargeIteration(m, cols);
             pivot(T, basis, z, m, cols, pr, pc);
 
             if (!bland) {
@@ -697,20 +793,29 @@ public final class LinearProgram {
                               int m, int cols, int pr, int pc) {
         SpRow prow = T[pr];
         Rational p = prow.get(pc);
+        long ops = prow.n;   // sparse-unit tally; charged only under SPARSE_CHARGE
         for (int k = 0; k < prow.n; k++) prow.val[k] = prow.val[k].divide(p);   // nonzero/p ≠ 0
         for (int i = 0; i < m; i++) {
             if (i == pr) continue;
             Rational f = T[i].get(pc);
             if (f.isZero()) continue;
+            ops += T[i].n + prow.n;   // the merge scans both rows' stored entries
             T[i] = subtractScaled(T[i], f, prow);
         }
         if (z != null) {
             Rational f = z[pc];
-            if (!f.isZero())
+            if (!f.isZero()) {
+                ops += prow.n;
                 for (int k = 0; k < prow.n; k++)
                     z[prow.idx[k]] = z[prow.idx[k]].subtract(f.multiply(prow.val[k]));
+            }
         }
         basis[pr] = pc;
+        // Charged after the fact (the tally needs the affected rows); at most one
+        // pivot of overshoot, and the abort point is still a deterministic function
+        // of the (unchanged) pivot trajectory. An abort here unwinds the whole
+        // solve to infeasible(), so the half-updated tableau is discarded.
+        chargeOps(ops);
     }
 
     private Rational[] extract(SpRow[] T, int[] basis, int m, int cols) {

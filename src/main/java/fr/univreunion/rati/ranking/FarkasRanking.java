@@ -375,6 +375,16 @@ public final class FarkasRanking {
 
     private static Certificate prove(IntegerTransitionSystem its, String entryLocation,
             List<SccProof> proofs, boolean forceEager) {
+        // Outcome funnel: every attempt ends here, so the budget high-water marks of
+        // proved vs unproved attempts (-Drati.budgetStats, the calibration data for
+        // -Drati.sparseCharge) are recorded in exactly one place. No-op otherwise.
+        Certificate c = proveInner(its, entryLocation, proofs, forceEager);
+        LinearProgram.recordAttempt(c.verdict == Verdict.TERMINATES);
+        return c;
+    }
+
+    private static Certificate proveInner(IntegerTransitionSystem its, String entryLocation,
+            List<SccProof> proofs, boolean forceEager) {
         List<SccProof> outProofs = proofs == null ? new ArrayList<SccProof>() : proofs;
         if (entryLocation == null || its.location(entryLocation) == null)
             return new Certificate(Verdict.UNKNOWN, outProofs);
