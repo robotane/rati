@@ -83,6 +83,30 @@ public final class ItsInvariants {
     private final Manager man = ApronManagers.polka();
     private long invOpSpent;   // per-compute cumulative post-image work; single-threaded
 
+    /**
+     * Per-transition static material of {@link #postImage} (-Drati.invPlanMemo).
+     * The combined environment, the converted guard/update {@code Lincons1} boxes,
+     * the result-variable arrays and the projection/rename target environments are
+     * a pure function of the transition, yet were rebuilt on every post-image —
+     * and one ascent + {@value #DESCEND_PASSES} descending passes post-image the
+     * same transition many times. The plan is memoised per {@link ItsInvariants}
+     * instance (one {@link #compute} call), so nothing outlives the fixpoint; the
+     * native op sequence and the {@link #INV_OP_BUDGET} charge are unchanged, so
+     * invariants are byte-identical.
+     */
+    private static final boolean PLAN_MEMO = Boolean.parseBoolean(System.getProperty("rati.invPlanMemo", "false"));
+    private static final class PostPlan {
+        final Environment full; final Lincons1[] cons; final String[] res;
+        final Environment resEnv; final String[] tvArr; final Environment tgtEnv; final int dim;
+        PostPlan(Environment full, Lincons1[] cons, String[] res,
+                Environment resEnv, String[] tvArr, Environment tgtEnv, int dim) {
+            this.full = full; this.cons = cons; this.res = res;
+            this.resEnv = resEnv; this.tvArr = tvArr; this.tgtEnv = tgtEnv; this.dim = dim;
+        }
+    }
+    private final Map<ItsTransition, PostPlan> postPlans =
+            PLAN_MEMO ? new java.util.IdentityHashMap<ItsTransition, PostPlan>() : null;
+
     private ItsInvariants() {}
 
     /**
@@ -322,8 +346,8 @@ public final class ItsInvariants {
 
     // -------------------------------------------------------------------------
 
-    /** Post-image of {@code src} (over source formals) through {@code t}, over target formals. */
-    private Abstract1 postImage(Abstract1 src, ItsTransition t) throws ApronException {
+    /** Builds the static (src-independent) material of one transition's post-image. */
+    private static PostPlan buildPostPlan(ItsTransition t) throws ApronException {
         List<String> sv = t.source().variables();
         List<String> tv = t.target().variables();
 
@@ -334,31 +358,45 @@ public final class ItsInvariants {
         String[] res = new String[tv.size()];
         for (int j = 0; j < res.length; j++) { res[j] = "__res" + j; names.add(res[j]); }
 
-        // Charge this post-image by its polyhedral dimension (the cost driver) and abort
-        // the whole fixpoint — sound, via an empty invariant map — once the budget is spent.
-        invOpSpent += names.size();
-        if (INV_OP_BUDGET > 0 && invOpSpent > INV_OP_BUDGET)
-            throw new RuntimeException("invariant op budget exhausted at " + invOpSpent);
-
         Environment full = new Environment(new String[0], names.toArray(new String[0]));
-        // src is the caller's live invariant — never disposed; every a_i below is a fresh
-        // copy, dead the moment the next transfer supersedes it (see supersede()).
-        Abstract1 a = src.changeEnvironmentCopy(man, full, false);
-
         List<Lincons1> cons = new ArrayList<Lincons1>();
         for (ItsLinearConstraint c : t.constraints()) cons.add(ApronBridge.toLincons(full, c));
         for (int j = 0; j < res.length; j++)
             cons.add(ApronBridge.bindEq(full, res[j], t.updates().get(j)));
-        a = supersede(a, a.meetCopy(man, cons.toArray(new Lincons1[0])));
+
+        Environment resEnv = new Environment(new String[0], res.clone());
+        Environment tgtEnv = new Environment(new String[0], tv.toArray(new String[0]));
+        return new PostPlan(full, cons.toArray(new Lincons1[0]), res,
+                resEnv, tv.toArray(new String[0]), tgtEnv, names.size());
+    }
+
+    /** Post-image of {@code src} (over source formals) through {@code t}, over target formals. */
+    private Abstract1 postImage(Abstract1 src, ItsTransition t) throws ApronException {
+        PostPlan plan = postPlans == null ? null : postPlans.get(t);
+        if (plan == null) {
+            plan = buildPostPlan(t);
+            if (postPlans != null) postPlans.put(t, plan);
+        }
+
+        // Charge this post-image by its polyhedral dimension (the cost driver) and abort
+        // the whole fixpoint — sound, via an empty invariant map — once the budget is spent.
+        invOpSpent += plan.dim;
+        if (INV_OP_BUDGET > 0 && invOpSpent > INV_OP_BUDGET)
+            throw new RuntimeException("invariant op budget exhausted at " + invOpSpent);
+
+        // src is the caller's live invariant — never disposed; every a_i below is a fresh
+        // copy, dead the moment the next transfer supersedes it (see supersede()).
+        Abstract1 a = src.changeEnvironmentCopy(man, plan.full, false);
+        a = supersede(a, a.meetCopy(man, plan.cons));
 
         // Project onto the result vars, then rename them to the target formals.
-        Environment resEnv = new Environment(new String[0], res.clone());
-        a = supersede(a, a.changeEnvironmentCopy(man, resEnv, true));
-        if (res.length > 0) a = supersede(a, a.renameCopy(man, res.clone(), tv.toArray(new String[0])));
+        // The rename arrays are cloned per call: Apron may reorder them in place.
+        a = supersede(a, a.changeEnvironmentCopy(man, plan.resEnv, true));
+        if (plan.res.length > 0)
+            a = supersede(a, a.renameCopy(man, plan.res.clone(), plan.tvArr.clone()));
 
         // Normalise to exactly the target-formal environment.
-        Environment tgtEnv = new Environment(new String[0], tv.toArray(new String[0]));
-        return supersede(a, a.changeEnvironmentCopy(man, tgtEnv, false));
+        return supersede(a, a.changeEnvironmentCopy(man, plan.tgtEnv, false));
     }
 
     private static Environment envOf(ItsLocation loc) {
