@@ -142,6 +142,56 @@ public final class ItsInvariants {
      * Conservative: a guard Apron cannot refute is kept (returns {@code false}).
      */
     public static boolean isInfeasible(ItsTransition t) {
+        if (INFEAS_MEMO) {
+            String key = guardKey(t.constraints(), null);
+            Boolean hit = INFEAS_CACHE.get(key);
+            if (hit != null) return hit.booleanValue();
+            boolean v = isInfeasibleRaw(t);
+            INFEAS_CACHE.put(key, Boolean.valueOf(v));
+            return v;
+        }
+        return isInfeasibleRaw(t);
+    }
+
+    /**
+     * Content-keyed memo of {@link #isInfeasible}/{@link #isInfeasibleUnder}
+     * (-Drati.infeasMemo). Each call builds, meets and empties a native Apron
+     * polyhedron, yet the answer is a pure function of the constraint content —
+     * and the same guard is re-tested constantly: the chainOnly gate
+     * ({@code maxSccTransitions}) and the prove that follows prune the same
+     * cyclic transitions twice per attempt, and every proof re-translates the
+     * shared whole-program transitions into fresh objects, so an identity memo
+     * would never hit across proofs. The key is the exact constraint sequence
+     * (terms in insertion order), so equal keys replay the identical Apron
+     * computation — verdicts are byte-identical. Distinct guards are bounded by
+     * the program's transitions, so the map stays small in a one-shot run.
+     *
+     * <p>Default ON (kill-switch {@code -Drati.infeasMemo=false}): byte-identical
+     * verdicts on Kitten (stdout) and scrabbly+tpdb_julia09; eng-setup 9.4/7.8 s
+     * → 0.6 s on Kitten (−92 %), wall −8-10 s.
+     */
+    private static final boolean INFEAS_MEMO =
+            Boolean.parseBoolean(System.getProperty("rati.infeasMemo", "true"));
+    private static final java.util.concurrent.ConcurrentHashMap<String, Boolean> INFEAS_CACHE =
+            INFEAS_MEMO ? new java.util.concurrent.ConcurrentHashMap<String, Boolean>() : null;
+
+    /** The exact content of a guard (and optional invariant) as a memo key. */
+    private static String guardKey(List<ItsLinearConstraint> guard, List<ItsLinearConstraint> inv) {
+        StringBuilder sb = new StringBuilder(64);
+        appendCons(sb, guard);
+        if (inv != null) { sb.append('|'); appendCons(sb, inv); }
+        return sb.toString();
+    }
+
+    private static void appendCons(StringBuilder sb, List<ItsLinearConstraint> cs) {
+        for (ItsLinearConstraint c : cs) {
+            for (Map.Entry<String, Long> e : c.lhs().coefficients().entrySet())
+                sb.append(e.getKey()).append(':').append(e.getValue().longValue()).append(',');
+            sb.append(c.lhs().constant()).append(c.op().symbol()).append('&');
+        }
+    }
+
+    private static boolean isInfeasibleRaw(ItsTransition t) {
         try {
             Manager man = ApronManagers.polka();
             LinkedHashSet<String> names = new LinkedHashSet<String>();
@@ -178,6 +228,18 @@ public final class ItsInvariants {
      */
     public static boolean isInfeasibleUnder(ItsTransition t, List<ItsLinearConstraint> srcInvariant) {
         if (srcInvariant == null || srcInvariant.isEmpty()) return isInfeasible(t);
+        if (INFEAS_MEMO) {
+            String key = guardKey(t.constraints(), srcInvariant);
+            Boolean hit = INFEAS_CACHE.get(key);
+            if (hit != null) return hit.booleanValue();
+            boolean v = isInfeasibleUnderRaw(t, srcInvariant);
+            INFEAS_CACHE.put(key, Boolean.valueOf(v));
+            return v;
+        }
+        return isInfeasibleUnderRaw(t, srcInvariant);
+    }
+
+    private static boolean isInfeasibleUnderRaw(ItsTransition t, List<ItsLinearConstraint> srcInvariant) {
         try {
             Manager man = ApronManagers.polka();
             LinkedHashSet<String> names = new LinkedHashSet<String>();
