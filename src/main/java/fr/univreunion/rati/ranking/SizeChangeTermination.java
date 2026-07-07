@@ -151,23 +151,39 @@ public final class SizeChangeTermination {
 
     // ------------------------------------------------------------- SCG model
 
-    /** A size-change graph for a call {@code src(x⃗) -> tgt(y⃗)}: arcs x_i ⇒ y_j. */
+    /** A size-change graph for a call {@code src(x⃗) -> tgt(y⃗)}: arcs x_i ⇒ y_j.
+     *  Identity for the closure's dedup is (src, tgt, matrix) — implemented as
+     *  {@link #hashCode}/{@link #equals} with a lazily-cached hash, so a duplicate
+     *  composition costs one hash + one matrix compare instead of materialising a
+     *  cell-per-character String key (the closure's measured HashMap hot spot). */
     static final class Scg {
         final String src, tgt;
         final byte[][] m;            // m[i][j] ∈ {NONE,GTE,GT}, i over src formals, j over tgt formals
         final int ni, nj;
-        private String key;          // lazily-cached canonical key
+        private int hash;            // lazily-cached; 0 = not yet computed
         Scg(String src, String tgt, byte[][] m) {
             this.src = src; this.tgt = tgt; this.m = m;
             this.ni = m.length; this.nj = ni == 0 ? 0 : m[0].length;
         }
-        String key() {
-            if (key == null) {
-                StringBuilder sb = new StringBuilder(src).append('|').append(tgt).append('|');
-                for (byte[] row : m) for (byte v : row) sb.append((char) ('0' + v));
-                key = sb.toString();
+        @Override public int hashCode() {
+            int h = hash;
+            if (h == 0) {
+                h = src.hashCode() * 31 + tgt.hashCode();
+                for (byte[] row : m) for (byte v : row) h = h * 31 + v;
+                if (h == 0) h = 1;
+                hash = h;
             }
-            return key;
+            return h;
+        }
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Scg)) return false;
+            Scg b = (Scg) o;
+            if (hashCode() != b.hashCode()) return false;
+            if (ni != b.ni || nj != b.nj || !src.equals(b.src) || !tgt.equals(b.tgt)) return false;
+            for (int i = 0; i < ni; i++)
+                if (!java.util.Arrays.equals(m[i], b.m[i])) return false;
+            return true;
         }
     }
 
@@ -212,11 +228,13 @@ public final class SizeChangeTermination {
      */
     private static ClosureResult decide(List<Scg> base, Budget budget) {
         ClosureResult res = new ClosureResult();
-        Map<String, Scg> all = new LinkedHashMap<String, Scg>();
+        // Keyed by the graph itself ((src,tgt,matrix) identity) — same dedup and same
+        // insertion order as the former String key, without building one per composition.
+        Map<Scg, Scg> all = new LinkedHashMap<Scg, Scg>();
         Map<String, List<Scg>> bySrc = new HashMap<String, List<Scg>>();
         Map<String, List<Scg>> byTgt = new HashMap<String, List<Scg>>();
         Deque<Scg> work = new ArrayDeque<Scg>();
-        for (Scg g : base) if (all.putIfAbsent(g.key(), g) == null) { index(g, bySrc, byTgt); work.add(g); }
+        for (Scg g : base) if (all.putIfAbsent(g, g) == null) { index(g, bySrc, byTgt); work.add(g); }
 
         long start = System.currentTimeMillis();
         while (!work.isEmpty()) {
@@ -250,9 +268,9 @@ public final class SizeChangeTermination {
         return res;
     }
 
-    private static void add(Scg g, Map<String, Scg> all, Map<String, List<Scg>> bySrc,
+    private static void add(Scg g, Map<Scg, Scg> all, Map<String, List<Scg>> bySrc,
             Map<String, List<Scg>> byTgt, Deque<Scg> work) {
-        if (all.putIfAbsent(g.key(), g) == null) { index(g, bySrc, byTgt); work.add(g); }
+        if (all.putIfAbsent(g, g) == null) { index(g, bySrc, byTgt); work.add(g); }
     }
 
     private static void index(Scg g, Map<String, List<Scg>> bySrc, Map<String, List<Scg>> byTgt) {
