@@ -108,6 +108,51 @@ public final class FarkasRanking {
     private static final Map<String, CachedRank> RANK_CACHE =
             RANK_ONCE ? new ConcurrentHashMap<String, CachedRank>() : null;
 
+    // --- loop-summary memo (-Drati.summaryMemo) ---
+    // LoopSummary.summarize is a pure function of the SCC's relational content —
+    // invariants never reach it — yet rankSccImpl re-summarises the same SCC on
+    // every entry-relative invariant retry; only the empty-invariant first pass
+    // is absorbed by rank-once. Cache the summary under the same content
+    // fingerprint rank-once trusts for whole verdicts. A bail-out (summarize
+    // returned its input unchanged: single self-loop, MAX_EDGES blow-up, Apron
+    // failure) is cached as a marker and replayed as the CALLER's own list, so
+    // the `summary != cyclicTrans` identity test downstream keeps its meaning.
+    // Default ON (kill-switch -Drati.summaryMemo=false): byte-identical on the
+    // Kitten gate and on the whole-jar self-analysis; big jar 1946→1899 s with
+    // the overlapped-proof residual 387→268 s (−31%), calls=329 hits=61.
+    private static final boolean SUMMARY_MEMO =
+            Boolean.parseBoolean(System.getProperty("rati.summaryMemo", "true"));
+    private static final Map<String, List<ItsTransition>> SUMMARY_CACHE =
+            SUMMARY_MEMO ? new ConcurrentHashMap<String, List<ItsTransition>>() : null;
+    /** Marker for a cached bail-out; never handed to callers. */
+    private static final List<ItsTransition> SUMMARY_BAIL = java.util.Collections.emptyList();
+    private static final AtomicLong SUMMARY_CALLS = new AtomicLong();
+    private static final AtomicLong SUMMARY_HITS = new AtomicLong();
+    static {
+        if (SUMMARY_MEMO && Boolean.getBoolean("rati.summaryMemoStats")) {
+            Runtime.getRuntime().addShutdownHook(new Thread(() ->
+                    System.err.printf("[summaryMemo] calls=%d hits=%d (%.1f%%) distinct=%d%n",
+                            SUMMARY_CALLS.get(), SUMMARY_HITS.get(),
+                            SUMMARY_CALLS.get() == 0 ? 0.0
+                                    : 100.0 * SUMMARY_HITS.get() / SUMMARY_CALLS.get(),
+                            SUMMARY_CACHE.size())));
+        }
+    }
+
+    private static List<ItsTransition> summarizeMemo(List<ItsTransition> cyclicTrans) {
+        if (!SUMMARY_MEMO) return LoopSummary.summarize(cyclicTrans);
+        SUMMARY_CALLS.incrementAndGet();
+        String fp = sccFingerprint(cyclicTrans);
+        List<ItsTransition> hit = SUMMARY_CACHE.get(fp);
+        if (hit != null) {
+            SUMMARY_HITS.incrementAndGet();
+            return hit == SUMMARY_BAIL ? cyclicTrans : hit;
+        }
+        List<ItsTransition> s = LoopSummary.summarize(cyclicTrans);
+        SUMMARY_CACHE.put(fp, s == cyclicTrans ? SUMMARY_BAIL : s);
+        return s;
+    }
+
     /** An SCC's entry-independent first-pass outcome: the verdict and (on success) its proof. */
     private static final class CachedRank {
         final Verdict verdict;
@@ -758,7 +803,7 @@ public final class FarkasRanking {
             if (proof != null) proof.cpfRounds.addAll(cpf);
             return record(proofs, proof, "lexicographic linear (ADFG)", rounds);
         }
-        List<ItsTransition> summary = LoopSummary.summarize(cyclicTrans);
+        List<ItsTransition> summary = summarizeMemo(cyclicTrans);
         List<ItsTransition> best = cyclicTrans;
         if (summary != cyclicTrans) {
             if (DEBUG) System.err.println("  retry on loop summary (" + summary.size() + " transitions)");
