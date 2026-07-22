@@ -96,6 +96,15 @@ no-Apron **size-change termination** triage before the Farkas path (a purely
 graph-based win short-circuits the LP entirely), and `-Drati.binterm=true` routes
 the verdict through the faithful BINTERM cascade (Algorithm 1, TOPLAS 2010 §7).
 
+Those two are part of a wider set of 34 `-Drati.*` tuning properties covering
+memoisation (`summaryMemo`, `infeasMemo`, `invPlanMemo`), the §8 structural caps
+(`sccMaxTransitions`, `invariantMaxLocations`, `mphiMaxDepth`), arithmetic and
+pivoting (`exactArith`, `pricing`, `sparseCharge`), and tracing (`proveLog`,
+`tierTiming`, `budgetStats`). Every one of them is validated by BCTerm's
+`Flags` registry, which rejects an unknown switch rather than silently ignoring
+it; the defaults are the measured-best configuration and none needs to be set
+for normal use.
+
 A handy alias:
 
 ```bash

@@ -4,11 +4,19 @@ Copyright 2026 robotane
 This product's own source code is licensed under the Apache License, Version 2.0
 (see LICENSE).
 
-This product bundles, UNMODIFIED and as separately-replaceable components, the
-Apron numerical abstract domain library and the GMP bindings:
+This product bundles, as separately-replaceable components, the Apron numerical
+abstract domain library and the GMP bindings:
 
   - fr.inria.apron:apron  (lib-repo/, lib/libjapron.so)
   - fr.inria.apron:gmp    (lib-repo/, lib/libjgmp.so)
+
+MODIFICATIONS. As required by the LGPL, note that these files are NOT the
+upstream releases. They are built from a locally patched japron fork, and the
+build outputs were further normalised for reproducibility: the Java classes are
+emitted at class-file version 61 (Java 17) with fixed archive timestamps, and
+the ELF .comment section was stripped from the shared objects. None of this
+changes the libraries' behaviour or their licence terms. Their upstream sources
+remain available at the address below.
 
 Apron and GMP are licensed under the GNU Lesser General Public License (LGPL).
 See https://antoinemine.github.io/Apron/doc/ for their upstream sources and
